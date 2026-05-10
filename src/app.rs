@@ -454,7 +454,7 @@ fn draw_sniffing_table(
     egui::ScrollArea::vertical().show(ui, |ui| {
         for item in items {
             table_row(ui, columns, |ui| {
-                table_cell(ui, columns[0], compact_text(&item.title, 28));
+                table_cell(ui, columns[0], &item.title);
                 table_cell(ui, columns[1], item.media_type.label());
                 table_cell(
                     ui,
@@ -465,7 +465,7 @@ fn draw_sniffing_table(
                 );
                 table_cell(ui, columns[3], "已嗅探");
                 table_cell(ui, columns[4], local_time(item.detected_at));
-                url_cell(ui, columns[5], &item.url);
+                table_cell(ui, columns[5], &item.url);
                 cell_ui(ui, columns[6], |ui| {
                     let supported = matches!(
                         item.media_type,
@@ -596,14 +596,7 @@ fn draw_task_table(
         for task in tasks {
             table_row(ui, columns, |ui| {
                 let selected = *selected_task_id == Some(task.id);
-                if ui
-                    .add_sized(
-                        [columns[0], 22.0],
-                        egui::Button::selectable(selected, compact_text(&task.title, 28))
-                            .frame(false),
-                    )
-                    .clicked()
-                {
+                if selectable_table_cell(ui, columns[0], &task.title, selected).clicked() {
                     *selected_task_id = Some(task.id);
                 }
                 table_cell(
@@ -636,7 +629,8 @@ fn draw_task_table(
                 table_cell(ui, columns[6], "-");
                 cell_ui(ui, columns[7], |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(compact_text(&task.message, 24));
+                        let action_width = if completed_only { 54.0 } else { 104.0 };
+                        table_cell(ui, (columns[7] - action_width).max(48.0), &task.message);
                         if completed_only && ui.button("删除").clicked() {
                             let id = task.id;
                             state.write(|app| app.tasks.retain(|task| task.id != id));
@@ -927,16 +921,56 @@ fn table_row(ui: &mut egui::Ui, widths: &[f32], add_contents: impl FnOnce(&mut e
         });
 }
 
-fn table_cell(ui: &mut egui::Ui, width: f32, text: impl Into<egui::WidgetText>) {
-    ui.add_sized([width, 22.0], egui::Label::new(text).truncate());
+fn table_cell(ui: &mut egui::Ui, width: f32, text: impl AsRef<str>) -> egui::Response {
+    let text = text.as_ref();
+    let (display, truncated) = elide_to_width(ui, text, width - 8.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.text(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        display,
+        egui::TextStyle::Body.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+
+    if truncated {
+        response.on_hover_text(text)
+    } else {
+        response
+    }
 }
 
-fn url_cell(ui: &mut egui::Ui, width: f32, url: &str) {
-    ui.add_sized(
-        [width, 22.0],
-        egui::Label::new(compact_text(url, 38)).truncate(),
-    )
-    .on_hover_text(url);
+fn selectable_table_cell(
+    ui: &mut egui::Ui,
+    width: f32,
+    text: &str,
+    selected: bool,
+) -> egui::Response {
+    let (display, truncated) = elide_to_width(ui, text, width - 8.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click());
+    let fill = if selected {
+        egui::Color32::from_rgb(205, 232, 255)
+    } else if response.hovered() {
+        egui::Color32::from_rgb(238, 246, 252)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 0.0, fill);
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.text(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        display,
+        egui::TextStyle::Body.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+
+    if truncated {
+        response.on_hover_text(text)
+    } else {
+        response
+    }
 }
 
 fn cell_ui(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -945,6 +979,48 @@ fn cell_ui(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egui::U
         egui::Layout::left_to_right(egui::Align::Center),
         add_contents,
     );
+}
+
+fn elide_to_width(ui: &egui::Ui, text: &str, width: f32) -> (String, bool) {
+    if text.is_empty() {
+        return (String::new(), false);
+    }
+
+    let available = width.max(0.0);
+    if text_width(ui, text) <= available {
+        return (text.to_string(), false);
+    }
+
+    let ellipsis = "...";
+    let ellipsis_width = text_width(ui, ellipsis);
+    if ellipsis_width >= available {
+        return (ellipsis.to_string(), true);
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut low = 0;
+    let mut high = chars.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let candidate = chars[..mid].iter().collect::<String>() + ellipsis;
+        if text_width(ui, &candidate) <= available {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    let display = chars[..low].iter().collect::<String>() + ellipsis;
+    (display, true)
+}
+
+fn text_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().text_color();
+    ui.painter()
+        .layout_no_wrap(text.to_string(), font_id, color)
+        .size()
+        .x
 }
 
 fn empty_row(ui: &mut egui::Ui, text: &str) {
@@ -999,16 +1075,6 @@ fn load_system_chinese_font() -> Option<Vec<u8>> {
     ];
 
     candidates.iter().find_map(|path| fs::read(path).ok())
-}
-
-fn compact_text(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let prefix = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{prefix}...")
-    } else {
-        prefix
-    }
 }
 
 fn human_bytes(bytes: u64) -> String {
