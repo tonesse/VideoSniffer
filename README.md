@@ -50,6 +50,17 @@ cargo run
 - HLS master playlist quality discovery, highest-bitrate default selection, and manual quality switching.
 - AES-128 HLS segment decryption using playlist-provided `EXT-X-KEY` metadata.
 - Optional HLS TS-to-MP4 remuxing through `ffmpeg -c copy`, with TS fallback when ffmpeg is unavailable.
+- Bundled ffmpeg at `third_party/ffmpeg/ffmpeg.exe`; package builds should include it next to the app or under `bin/ffmpeg.exe`.
+
+## Bundled FFmpeg
+
+The app resolves ffmpeg in this order:
+
+1. `VIDEOSNIFFER_FFMPEG` environment variable.
+2. `ffmpeg.exe` next to the packaged app.
+3. `bin/ffmpeg.exe` next to the packaged app.
+4. `third_party/ffmpeg/ffmpeg.exe` in the repo or packaged directory.
+5. `ffmpeg` from system `PATH`.
 
 ## Next Implementation Step
 

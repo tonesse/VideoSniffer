@@ -781,13 +781,14 @@ struct RemuxResult {
 }
 
 async fn remux_hls_output_if_possible(ts_path: &Path) -> anyhow::Result<RemuxResult> {
+    let ffmpeg_path = ffmpeg_path();
     let mp4_path = ts_path.with_extension("mp4");
     let ts_path = ts_path.to_path_buf();
     let ts_path_for_task = ts_path.clone();
     let mp4_path_for_task = mp4_path.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        Command::new("ffmpeg")
+        Command::new(&ffmpeg_path)
             .args([
                 "-y",
                 "-hide_banner",
@@ -830,6 +831,42 @@ async fn remux_hls_output_if_possible(ts_path: &Path) -> anyhow::Result<RemuxRes
             message: format!("已保留 TS: {}；启动 ffmpeg 失败: {err}", ts_path.display()),
         }),
     }
+}
+
+fn ffmpeg_path() -> PathBuf {
+    if let Ok(path) = std::env::var("VIDEOSNIFFER_FFMPEG") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return path;
+        }
+    }
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(exe_dir) = current_exe.parent()
+    {
+        for candidate in [
+            exe_dir.join("ffmpeg.exe"),
+            exe_dir.join("bin").join("ffmpeg.exe"),
+            exe_dir
+                .join("third_party")
+                .join("ffmpeg")
+                .join("ffmpeg.exe"),
+        ] {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+
+    let dev_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("third_party")
+        .join("ffmpeg")
+        .join("ffmpeg.exe");
+    if dev_candidate.exists() {
+        return dev_candidate;
+    }
+
+    PathBuf::from("ffmpeg")
 }
 
 fn mark_failed(state: &SharedState, task_id: Uuid, message: String) {
