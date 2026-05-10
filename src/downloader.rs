@@ -26,6 +26,7 @@ pub fn enqueue_download(state: SharedState, media: &MediaItem) {
         progress: 0.0,
         downloaded_bytes: 0,
         total_bytes: None,
+        completed_segments: 0,
         message: "等待下载".to_string(),
     };
     let task_id = task.id;
@@ -218,7 +219,8 @@ async fn download_hls(
 
     state.write(|app| {
         if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
-            task.total_bytes = Some(total_segments as u64);
+            task.completed_segments = 0;
+            task.total_bytes = None;
             task.message = format!("开始下载 {total_segments} 个 HLS 分片，线程数 {part_threads}");
         }
     });
@@ -421,10 +423,12 @@ fn add_hls_segment(
     state.write(|app| {
         if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
             task.downloaded_bytes = task.downloaded_bytes.saturating_add(bytes);
-            task.total_bytes = Some(total_segments as u64);
-            task.progress = (segment_number as f32 / total_segments.max(1) as f32).clamp(0.0, 1.0);
+            task.completed_segments = task.completed_segments.saturating_add(1);
+            task.progress =
+                (task.completed_segments as f32 / total_segments.max(1) as f32).clamp(0.0, 1.0);
             task.message = format!(
-                "已下载分片 {segment_number}/{total_segments}，累计 {}",
+                "已下载分片 {}/{total_segments}，最近完成 #{segment_number}，累计 {}",
+                task.completed_segments,
                 format_bytes(task.downloaded_bytes)
             );
         }

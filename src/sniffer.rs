@@ -59,7 +59,24 @@ async fn receive_media(
     }
 
     state.write(|app| {
-        if app.detected.iter().any(|item| item.url == candidate.url) {
+        if let Some(item) = app
+            .detected
+            .iter_mut()
+            .find(|item| item.url == candidate.url)
+        {
+            if !candidate.request_headers.is_empty() {
+                item.headers = candidate.request_headers.clone();
+            }
+            if candidate.page_url.is_some() {
+                item.page_url = candidate.page_url.clone();
+            }
+            if let Some(title) = candidate
+                .title
+                .as_ref()
+                .filter(|title| !title.trim().is_empty())
+            {
+                item.title = title.clone();
+            }
             return;
         }
 

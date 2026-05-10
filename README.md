@@ -6,6 +6,7 @@ Rust Windows desktop app prototype for browser video sniffing and multi-threaded
 
 - Browser extension captures media network responses.
 - Extension sends candidate video URLs to `http://127.0.0.1:37651/api/media`.
+- Extension preserves key playback request headers such as Cookie, Referer, Origin and User-Agent for the downloader.
 - Rust app shows detected media and download queue.
 - Downloader supports direct MP4/WEBM/unknown file URLs with ranged multi-thread download when the server supports `Accept-Ranges: bytes`.
 - HLS media playlists are downloaded by fetching segments concurrently and merging them into a `.ts` output file.
@@ -30,6 +31,7 @@ cargo run
 - Desktop UI.
 - Save directory setting.
 - Detected media list.
+- Request header forwarding from the browser extension.
 - Download queue.
 - Multi-thread ranged download for direct media files.
 - Non-encrypted HLS media playlist segment download and merge.
