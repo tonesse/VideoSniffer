@@ -1,6 +1,7 @@
 mod app;
 mod downloader;
 mod hls;
+mod net;
 mod sniffer;
 mod state;
 

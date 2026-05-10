@@ -3,6 +3,7 @@ use crate::{
         HlsKey, HlsKeyMethod, HlsSegment, choose_highest_variant, parse_hls_playlist,
         sort_variants_highest_first,
     },
+    net::{build_client, bytes_with_retry, send_with_retry, text_with_retry},
     state::{
         DownloadStatus, DownloadTask, HeaderPair, MediaItem, MediaType, SharedState,
         filename_from_url,
@@ -163,13 +164,13 @@ async fn run_task(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
 
     wait_if_paused(&state, task_id).await?;
     fs::create_dir_all(&save_dir).await?;
-    let client = Client::builder().build()?;
+    let client = build_client()?;
     let header_map = to_header_map(&headers);
-    let head = client
-        .head(&task.url)
-        .headers(header_map.clone())
-        .send()
-        .await?;
+    let head = send_with_retry(
+        client.head(&task.url).headers(header_map.clone()),
+        "获取直链媒体信息",
+    )
+    .await?;
     let total = head
         .headers()
         .get(CONTENT_LENGTH)
@@ -242,17 +243,14 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
 
     wait_if_paused(&state, task_id).await?;
     fs::create_dir_all(&save_dir).await?;
-    let client = Client::builder().build()?;
+    let client = build_client()?;
     let header_map = to_header_map(&headers);
     let mut playlist_url = task.url.clone();
-    let mut playlist_text = client
-        .get(&playlist_url)
-        .headers(header_map.clone())
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let mut playlist_text = text_with_retry(
+        client.get(&playlist_url).headers(header_map.clone()),
+        "获取 HLS 播放列表",
+    )
+    .await?;
 
     let mut playlist = parse_hls_playlist(&playlist_url, &playlist_text)?;
     if playlist.is_master() {
@@ -265,14 +263,11 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
                 task.message = format!("自动选择清晰度 {}", selected_variant.label());
             }
         });
-        playlist_text = client
-            .get(&playlist_url)
-            .headers(header_map.clone())
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+        playlist_text = text_with_retry(
+            client.get(&playlist_url).headers(header_map.clone()),
+            "获取 HLS 清晰度播放列表",
+        )
+        .await?;
         playlist = parse_hls_playlist(&playlist_url, &playlist_text)?;
     }
     if playlist.segments.is_empty() {
@@ -307,14 +302,11 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
         handles.push(tokio::spawn(async move {
             let _permit = permit;
             wait_if_paused(&state, task_id).await?;
-            let bytes = client
-                .get(&segment.url)
-                .headers(header_map.clone())
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await?;
+            let bytes = bytes_with_retry(
+                client.get(&segment.url).headers(header_map.clone()),
+                "下载 HLS 分片",
+            )
+            .await?;
             let bytes =
                 decrypt_hls_segment(&client, header_map, &key_cache, &segment, bytes.as_ref())
                     .await?;
@@ -393,14 +385,8 @@ async fn fetch_hls_key(
         return Ok(cached);
     }
 
-    let bytes = client
-        .get(&key.uri)
-        .headers(headers)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let bytes =
+        bytes_with_retry(client.get(&key.uri).headers(headers), "获取 HLS 解密 key").await?;
     if bytes.len() != 16 {
         return Err(anyhow!("HLS AES-128 key 长度不是 16 字节"));
     }
@@ -421,7 +407,7 @@ async fn download_single(
     url: String,
     output: PathBuf,
 ) -> anyhow::Result<()> {
-    let mut response = client.get(url).headers(headers).send().await?;
+    let mut response = send_with_retry(client.get(url).headers(headers), "下载直链媒体").await?;
     let total = response.content_length();
     let mut file = File::create(output).await?;
     let mut downloaded = 0_u64;
@@ -472,10 +458,8 @@ async fn download_ranged(
                 HeaderValue::from_str(&format!("bytes={start}-{end}"))
                     .context("invalid range header")?,
             );
-            let mut response = client.get(url).headers(part_headers).send().await?;
-            if !response.status().is_success() {
-                return Err(anyhow!("range request failed: {}", response.status()));
-            }
+            let mut response =
+                send_with_retry(client.get(url).headers(part_headers), "下载直链分片").await?;
 
             let mut file = File::options().write(true).open(output).await?;
             file.seek(std::io::SeekFrom::Start(start)).await?;
