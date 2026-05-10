@@ -1,9 +1,17 @@
 use anyhow::{Context, anyhow};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 use tokio::time::sleep;
 
-const MAX_ATTEMPTS: usize = 4;
+const DEFAULT_MAX_ATTEMPTS: usize = 4;
+static MAX_ATTEMPTS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_ATTEMPTS);
+
+pub fn set_retry_attempts(attempts: usize) {
+    MAX_ATTEMPTS.store(attempts.clamp(1, 20), Ordering::Relaxed);
+}
 
 pub fn build_client() -> anyhow::Result<Client> {
     Client::builder()
@@ -18,18 +26,19 @@ pub async fn send_with_retry(
     builder: RequestBuilder,
     description: &str,
 ) -> anyhow::Result<Response> {
+    let max_attempts = MAX_ATTEMPTS.load(Ordering::Relaxed).max(1);
     let mut last_error = None;
 
-    for attempt in 1..=MAX_ATTEMPTS {
+    for attempt in 1..=max_attempts {
         let Some(request) = builder.try_clone() else {
-            return Err(anyhow!("{description}: 请求无法克隆，不能重试"));
+            return Err(anyhow!("{description}: 请求无法复制，不能重试"));
         };
 
         match request.send().await {
             Ok(response) if response.status().is_success() => return Ok(response),
             Ok(response) => {
                 let status = response.status();
-                if should_retry_status(status) && attempt < MAX_ATTEMPTS {
+                if should_retry_status(status) && attempt < max_attempts {
                     sleep(backoff(attempt)).await;
                     continue;
                 }
@@ -39,7 +48,7 @@ pub async fn send_with_retry(
                 let retryable =
                     err.is_timeout() || err.is_connect() || err.is_request() || err.is_body();
                 last_error = Some(classify_reqwest_error(description, &err));
-                if retryable && attempt < MAX_ATTEMPTS {
+                if retryable && attempt < max_attempts {
                     sleep(backoff(attempt)).await;
                     continue;
                 }

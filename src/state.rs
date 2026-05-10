@@ -24,6 +24,7 @@ impl SharedState {
     pub fn new() -> Self {
         let persist_path = state_file_path();
         let mut app_state = load_state(&persist_path).unwrap_or_else(default_state);
+        app_state.detected.clear();
 
         for task in &mut app_state.tasks {
             if matches!(
@@ -31,7 +32,7 @@ impl SharedState {
                 DownloadStatus::Downloading | DownloadStatus::Queued
             ) {
                 task.status = DownloadStatus::Paused;
-                task.message = "应用已重启，点击恢复可重新开始下载".to_string();
+                task.message = "应用已重启，点击恢复可继续下载".to_string();
             }
         }
 
@@ -106,10 +107,12 @@ fn default_state() -> AppState {
         tasks: Vec::new(),
         settings: Settings {
             save_dir: download_dir,
-            max_tasks: 3,
-            part_threads: 8,
-            min_media_size_mb: 10,
+            max_tasks: default_max_tasks(),
+            part_threads: default_part_threads(),
+            min_media_size_mb: default_min_media_size_mb(),
             listen_port: 37651,
+            request_retry_attempts: default_request_retry_attempts(),
+            part_retry_attempts: default_part_retry_attempts(),
         },
     }
 }
@@ -137,10 +140,37 @@ pub struct AppState {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Settings {
     pub save_dir: PathBuf,
+    #[serde(default = "default_max_tasks")]
     pub max_tasks: usize,
+    #[serde(default = "default_part_threads")]
     pub part_threads: usize,
+    #[serde(default = "default_min_media_size_mb")]
     pub min_media_size_mb: u64,
     pub listen_port: u16,
+    #[serde(default = "default_request_retry_attempts")]
+    pub request_retry_attempts: usize,
+    #[serde(default = "default_part_retry_attempts")]
+    pub part_retry_attempts: usize,
+}
+
+fn default_max_tasks() -> usize {
+    3
+}
+
+fn default_part_threads() -> usize {
+    8
+}
+
+fn default_min_media_size_mb() -> u64 {
+    10
+}
+
+fn default_request_retry_attempts() -> usize {
+    4
+}
+
+fn default_part_retry_attempts() -> usize {
+    5
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

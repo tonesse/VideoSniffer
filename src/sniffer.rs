@@ -61,11 +61,12 @@ async fn receive_media(
         return with_cors((StatusCode::NO_CONTENT, "ignored"));
     }
 
+    let candidate_key = media_dedupe_key(&candidate.url);
     let hls_media_id = state.write(|app| {
         if let Some(item) = app
             .detected
             .iter_mut()
-            .find(|item| item.url == candidate.url)
+            .find(|item| media_dedupe_key(&item.url) == candidate_key)
         {
             if !candidate.request_headers.is_empty() {
                 item.headers = candidate.request_headers.clone();
@@ -117,6 +118,49 @@ fn looks_like_media(candidate: &MediaCandidate) -> bool {
         || mime.contains("video/")
         || mime.contains("mpegurl")
         || mime.contains("dash")
+}
+
+fn media_dedupe_key(url: &str) -> String {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let Some((base, query)) = without_fragment.split_once('?') else {
+        return without_fragment.to_ascii_lowercase();
+    };
+
+    let mut stable_params = query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .filter(|part| {
+            let key = part
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            !matches!(
+                key.as_str(),
+                "range"
+                    | "start"
+                    | "end"
+                    | "r"
+                    | "rnd"
+                    | "random"
+                    | "ts"
+                    | "t"
+                    | "_"
+                    | "token"
+                    | "expires"
+                    | "expire"
+                    | "deadline"
+            )
+        })
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    stable_params.sort();
+
+    if stable_params.is_empty() {
+        base.to_ascii_lowercase()
+    } else {
+        format!("{}?{}", base.to_ascii_lowercase(), stable_params.join("&"))
+    }
 }
 
 fn with_cors<T>(response: T) -> impl IntoResponse
