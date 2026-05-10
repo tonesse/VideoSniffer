@@ -17,9 +17,10 @@ use reqwest::{
     header::{ACCEPT_RANGES, CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue, RANGE},
 };
 use sanitize_filename::sanitize;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, VecDeque},
-    path::PathBuf,
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
 };
@@ -283,13 +284,26 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
     let task_dir = save_dir.join(".parts").join(task_id.to_string());
     fs::create_dir_all(&task_dir).await?;
     let output = save_dir.join(output_filename(&task));
-    let total_segments = playlist.segments.len();
+    let manifest_path = task_dir.join("manifest.json");
+    let mut manifest = load_part_manifest(&manifest_path).await;
+    manifest.task_id = task_id.to_string();
+    manifest.kind = ManifestKind::Hls;
+    manifest.total_parts = playlist.segments.len();
+    let completed = manifest.completed_hls_indices();
+    persist_part_manifest(&manifest_path, &manifest).await?;
 
+    let total_segments = playlist.segments.len();
     state.write(|app| {
         if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
-            task.completed_segments = 0;
+            task.completed_segments = completed.len();
+            task.downloaded_bytes = manifest.downloaded_bytes();
             task.total_bytes = None;
-            task.message = format!("开始下载 {total_segments} 个 HLS 分片，线程数 {part_threads}");
+            task.progress =
+                (task.completed_segments as f32 / total_segments.max(1) as f32).clamp(0.0, 1.0);
+            task.message = format!(
+                "开始下载 {total_segments} 个 HLS 分片，已跳过 {} 个完成分片，线程数 {part_threads}",
+                completed.len()
+            );
         }
     });
 
@@ -298,6 +312,7 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
             .segments
             .into_iter()
             .enumerate()
+            .filter(|(index, _)| !completed.contains(index))
             .map(|(index, segment)| HlsPartJob {
                 index,
                 segment,
@@ -306,6 +321,8 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
             .collect::<VecDeque<_>>(),
     ));
     let key_cache = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
+    let manifest = Arc::new(Mutex::new(manifest));
+    let manifest_path = Arc::new(manifest_path);
     let mut handles = Vec::with_capacity(part_threads);
 
     for _ in 0..part_threads {
@@ -315,6 +332,8 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
         let task_dir = task_dir.clone();
         let key_cache = key_cache.clone();
         let queue = queue.clone();
+        let manifest = manifest.clone();
+        let manifest_path = manifest_path.clone();
 
         handles.push(tokio::spawn(async move {
             loop {
@@ -332,6 +351,8 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
                     &task_dir,
                     &job,
                     total_segments,
+                    &manifest_path,
+                    &manifest,
                 )
                 .await
                 {
@@ -412,10 +433,19 @@ async fn download_hls_part(
     client: &Client,
     header_map: HeaderMap,
     key_cache: &Mutex<HashMap<String, Vec<u8>>>,
-    task_dir: &PathBuf,
+    task_dir: &Path,
     job: &HlsPartJob,
     total_segments: usize,
+    manifest_path: &Path,
+    manifest: &Mutex<PartManifest>,
 ) -> anyhow::Result<()> {
+    let part_path = task_dir.join(format!("{:06}.part", job.index));
+    if let Ok(metadata) = fs::metadata(&part_path).await {
+        mark_hls_part_complete(manifest_path, manifest, job.index, metadata.len()).await?;
+        add_hls_segment(state, task_id, job.index + 1, total_segments, 0);
+        return Ok(());
+    }
+
     let bytes = bytes_with_retry(
         client.get(&job.segment.url).headers(header_map.clone()),
         "下载 HLS 分片",
@@ -423,8 +453,8 @@ async fn download_hls_part(
     .await?;
     let bytes =
         decrypt_hls_segment(client, header_map, key_cache, &job.segment, bytes.as_ref()).await?;
-    let part_path = task_dir.join(format!("{:06}.part", job.index));
     fs::write(part_path, &bytes).await?;
+    mark_hls_part_complete(manifest_path, manifest, job.index, bytes.len() as u64).await?;
     add_hls_segment(
         state,
         task_id,
@@ -519,9 +549,39 @@ async fn download_ranged(
     file.set_len(total).await?;
     drop(file);
 
+    let task_dir = output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".parts")
+        .join(task_id.to_string());
+    fs::create_dir_all(&task_dir).await?;
+    let manifest_path = task_dir.join("manifest.json");
+    let mut manifest = load_part_manifest(&manifest_path).await;
+    manifest.task_id = task_id.to_string();
+    manifest.kind = ManifestKind::Range;
+    let completed = manifest.completed_ranges();
+    let completed_lookup = completed
+        .iter()
+        .map(|part| (part.start, part.end))
+        .collect::<HashSet<_>>();
+    let downloaded = completed
+        .iter()
+        .map(|part| part.end.saturating_sub(part.start).saturating_add(1))
+        .sum::<u64>();
+    persist_part_manifest(&manifest_path, &manifest).await?;
+
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.downloaded_bytes = downloaded.min(total);
+            task.progress = (task.downloaded_bytes as f32 / total.max(1) as f32).clamp(0.0, 1.0);
+            task.message = format!("继续 Range 分片下载，已跳过 {} 个完成分片", completed.len());
+        }
+    });
+
     let queue = Arc::new(Mutex::new(
         split_ranges(total, part_threads.max(1))
             .into_iter()
+            .filter(|range| !completed_lookup.contains(range))
             .map(|(start, end)| RangePartJob {
                 start,
                 end,
@@ -529,6 +589,8 @@ async fn download_ranged(
             })
             .collect::<VecDeque<_>>(),
     ));
+    let manifest = Arc::new(Mutex::new(manifest));
+    let manifest_path = Arc::new(manifest_path);
     let mut handles = Vec::with_capacity(part_threads.max(1));
 
     for _ in 0..part_threads.max(1) {
@@ -538,6 +600,8 @@ async fn download_ranged(
         let url = url.clone();
         let output = output.clone();
         let queue = queue.clone();
+        let manifest = manifest.clone();
+        let manifest_path = manifest_path.clone();
 
         handles.push(tokio::spawn(async move {
             loop {
@@ -555,6 +619,8 @@ async fn download_ranged(
                     &output,
                     &job,
                     total,
+                    &manifest_path,
+                    &manifest,
                 )
                 .await
                 {
@@ -588,6 +654,7 @@ async fn download_ranged(
         handle.await??;
     }
 
+    fs::remove_dir_all(task_dir).await.ok();
     Ok(())
 }
 
@@ -612,9 +679,11 @@ async fn download_range_part(
     client: &Client,
     mut headers: HeaderMap,
     url: &str,
-    output: &PathBuf,
+    output: &Path,
     job: &RangePartJob,
     total: u64,
+    manifest_path: &Path,
+    manifest: &Mutex<PartManifest>,
 ) -> anyhow::Result<()> {
     headers.insert(
         RANGE,
@@ -630,6 +699,7 @@ async fn download_range_part(
         file.write_all(&chunk).await?;
         add_downloaded(state, task_id, chunk.len() as u64, total);
     }
+    mark_range_part_complete(manifest_path, manifest, job.start, job.end).await?;
     Ok(())
 }
 
@@ -727,6 +797,132 @@ fn note_part_deprioritized(state: &SharedState, task_id: Uuid, message: String) 
             task.message = message;
         }
     });
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct PartManifest {
+    task_id: String,
+    kind: ManifestKind,
+    total_parts: usize,
+    hls_parts: Vec<HlsPartRecord>,
+    range_parts: Vec<RangePartRecord>,
+}
+
+impl PartManifest {
+    fn completed_hls_indices(&self) -> HashSet<usize> {
+        self.hls_parts
+            .iter()
+            .filter(|part| part.completed)
+            .map(|part| part.index)
+            .collect()
+    }
+
+    fn completed_ranges(&self) -> Vec<RangePartRecord> {
+        self.range_parts
+            .iter()
+            .filter(|part| part.completed)
+            .cloned()
+            .collect()
+    }
+
+    fn downloaded_bytes(&self) -> u64 {
+        self.hls_parts
+            .iter()
+            .filter(|part| part.completed)
+            .map(|part| part.bytes)
+            .sum()
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+enum ManifestKind {
+    #[default]
+    Unknown,
+    Hls,
+    Range,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct HlsPartRecord {
+    index: usize,
+    bytes: u64,
+    completed: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct RangePartRecord {
+    start: u64,
+    end: u64,
+    completed: bool,
+}
+
+async fn load_part_manifest(path: &Path) -> PartManifest {
+    let Ok(json) = fs::read_to_string(path).await else {
+        return PartManifest::default();
+    };
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+async fn persist_part_manifest(path: &Path, manifest: &PartManifest) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let json = serde_json::to_string_pretty(manifest)?;
+    fs::write(path, json).await?;
+    Ok(())
+}
+
+async fn mark_hls_part_complete(
+    path: &Path,
+    manifest: &Mutex<PartManifest>,
+    index: usize,
+    bytes: u64,
+) -> anyhow::Result<()> {
+    let snapshot = {
+        let mut manifest = manifest.lock().await;
+        if let Some(part) = manifest
+            .hls_parts
+            .iter_mut()
+            .find(|part| part.index == index)
+        {
+            part.bytes = bytes;
+            part.completed = true;
+        } else {
+            manifest.hls_parts.push(HlsPartRecord {
+                index,
+                bytes,
+                completed: true,
+            });
+        }
+        manifest.clone()
+    };
+    persist_part_manifest(path, &snapshot).await
+}
+
+async fn mark_range_part_complete(
+    path: &Path,
+    manifest: &Mutex<PartManifest>,
+    start: u64,
+    end: u64,
+) -> anyhow::Result<()> {
+    let snapshot = {
+        let mut manifest = manifest.lock().await;
+        if let Some(part) = manifest
+            .range_parts
+            .iter_mut()
+            .find(|part| part.start == start && part.end == end)
+        {
+            part.completed = true;
+        } else {
+            manifest.range_parts.push(RangePartRecord {
+                start,
+                end,
+                completed: true,
+            });
+        }
+        manifest.clone()
+    };
+    persist_part_manifest(path, &snapshot).await
 }
 
 async fn wait_if_paused(state: &SharedState, task_id: Uuid) -> anyhow::Result<()> {
