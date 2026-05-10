@@ -10,6 +10,7 @@ Rust Windows desktop app prototype for browser video sniffing and multi-threaded
 - Rust app shows detected media and download queue.
 - Detected media, settings and tasks are persisted locally so the app can restore them after restart.
 - Network requests use timeout, retry, exponential backoff and clearer source-error classification.
+- Failed HLS or range parts are deprioritized and retried later so other parts can continue first.
 - Downloader supports direct MP4/WEBM/unknown file URLs with ranged multi-thread download when the server supports `Accept-Ranges: bytes`.
 - HLS media playlists are downloaded by fetching segments concurrently and merging them into a `.ts` output file.
 - HLS master playlists are analyzed automatically. The app defaults to the highest bitrate variant and lets the user switch quality in the UI before downloading.
@@ -40,6 +41,7 @@ cargo run
 - Pause/resume controls for active tasks.
 - Persisted task history and settings.
 - Retry handling for playlist, key, segment, direct and range requests.
+- Per-part retry queue for HLS segments and ranged direct downloads.
 - Multi-thread ranged download for direct media files.
 - Non-encrypted HLS media playlist segment download and merge.
 - HLS master playlist quality discovery, highest-bitrate default selection, and manual quality switching.

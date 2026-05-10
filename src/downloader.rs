@@ -17,16 +17,22 @@ use reqwest::{
     header::{ACCEPT_RANGES, CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue, RANGE},
 };
 use sanitize_filename::sanitize;
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+};
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::{Mutex, Semaphore},
+    sync::Mutex,
     time::{Duration, sleep},
 };
 use uuid::Uuid;
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
+const MAX_PART_ATTEMPTS: usize = 5;
 
 pub fn enqueue_download(state: SharedState, media: &MediaItem) {
     let task = DownloadTask {
@@ -287,38 +293,70 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
         }
     });
 
-    let semaphore = Arc::new(Semaphore::new(part_threads));
+    let queue = Arc::new(Mutex::new(
+        playlist
+            .segments
+            .into_iter()
+            .enumerate()
+            .map(|(index, segment)| HlsPartJob {
+                index,
+                segment,
+                attempts: 0,
+            })
+            .collect::<VecDeque<_>>(),
+    ));
     let key_cache = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
-    let mut handles = Vec::with_capacity(total_segments);
+    let mut handles = Vec::with_capacity(part_threads);
 
-    for (index, segment) in playlist.segments.iter().cloned().enumerate() {
-        let permit = semaphore.clone().acquire_owned().await?;
+    for _ in 0..part_threads {
         let state = state.clone();
         let client = client.clone();
         let header_map = header_map.clone();
         let task_dir = task_dir.clone();
         let key_cache = key_cache.clone();
+        let queue = queue.clone();
 
         handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            wait_if_paused(&state, task_id).await?;
-            let bytes = bytes_with_retry(
-                client.get(&segment.url).headers(header_map.clone()),
-                "下载 HLS 分片",
-            )
-            .await?;
-            let bytes =
-                decrypt_hls_segment(&client, header_map, &key_cache, &segment, bytes.as_ref())
-                    .await?;
-            let part_path = task_dir.join(format!("{index:06}.part"));
-            fs::write(part_path, &bytes).await?;
-            add_hls_segment(
-                &state,
-                task_id,
-                index + 1,
-                total_segments,
-                bytes.len() as u64,
-            );
+            loop {
+                let Some(mut job) = pop_hls_job(&queue).await else {
+                    break;
+                };
+
+                wait_if_paused(&state, task_id).await?;
+                match download_hls_part(
+                    &state,
+                    task_id,
+                    &client,
+                    header_map.clone(),
+                    &key_cache,
+                    &task_dir,
+                    &job,
+                    total_segments,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(err) => {
+                        job.attempts += 1;
+                        if job.attempts >= MAX_PART_ATTEMPTS {
+                            return Err(anyhow!(
+                                "HLS 分片 #{} 多次重试后仍失败: {err}",
+                                job.index + 1
+                            ));
+                        }
+                        note_part_deprioritized(
+                            &state,
+                            task_id,
+                            format!(
+                                "HLS 分片 #{} 失败，已降低优先级稍后重试 ({}/{MAX_PART_ATTEMPTS})",
+                                job.index + 1,
+                                job.attempts
+                            ),
+                        );
+                        push_hls_job(&queue, job).await;
+                    }
+                }
+            }
             Ok::<_, anyhow::Error>(())
         }));
     }
@@ -349,6 +387,50 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
         &state,
         task_id,
         format!("HLS 合并完成: {}", output.display()),
+    );
+    Ok(())
+}
+
+#[derive(Clone)]
+struct HlsPartJob {
+    index: usize,
+    segment: HlsSegment,
+    attempts: usize,
+}
+
+async fn pop_hls_job(queue: &Mutex<VecDeque<HlsPartJob>>) -> Option<HlsPartJob> {
+    queue.lock().await.pop_front()
+}
+
+async fn push_hls_job(queue: &Mutex<VecDeque<HlsPartJob>>, job: HlsPartJob) {
+    queue.lock().await.push_back(job);
+}
+
+async fn download_hls_part(
+    state: &SharedState,
+    task_id: Uuid,
+    client: &Client,
+    header_map: HeaderMap,
+    key_cache: &Mutex<HashMap<String, Vec<u8>>>,
+    task_dir: &PathBuf,
+    job: &HlsPartJob,
+    total_segments: usize,
+) -> anyhow::Result<()> {
+    let bytes = bytes_with_retry(
+        client.get(&job.segment.url).headers(header_map.clone()),
+        "下载 HLS 分片",
+    )
+    .await?;
+    let bytes =
+        decrypt_hls_segment(client, header_map, key_cache, &job.segment, bytes.as_ref()).await?;
+    let part_path = task_dir.join(format!("{:06}.part", job.index));
+    fs::write(part_path, &bytes).await?;
+    add_hls_segment(
+        state,
+        task_id,
+        job.index + 1,
+        total_segments,
+        bytes.len() as u64,
     );
     Ok(())
 }
@@ -437,37 +519,66 @@ async fn download_ranged(
     file.set_len(total).await?;
     drop(file);
 
-    let ranges = split_ranges(total, part_threads.max(1));
-    let semaphore = Arc::new(Semaphore::new(part_threads.max(1)));
-    let mut handles = Vec::with_capacity(ranges.len());
+    let queue = Arc::new(Mutex::new(
+        split_ranges(total, part_threads.max(1))
+            .into_iter()
+            .map(|(start, end)| RangePartJob {
+                start,
+                end,
+                attempts: 0,
+            })
+            .collect::<VecDeque<_>>(),
+    ));
+    let mut handles = Vec::with_capacity(part_threads.max(1));
 
-    for (start, end) in ranges {
-        let permit = semaphore.clone().acquire_owned().await?;
+    for _ in 0..part_threads.max(1) {
         let state = state.clone();
         let client = client.clone();
         let headers = headers.clone();
         let url = url.clone();
         let output = output.clone();
+        let queue = queue.clone();
 
         handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            wait_if_paused(&state, task_id).await?;
-            let mut part_headers = headers;
-            part_headers.insert(
-                RANGE,
-                HeaderValue::from_str(&format!("bytes={start}-{end}"))
-                    .context("invalid range header")?,
-            );
-            let mut response =
-                send_with_retry(client.get(url).headers(part_headers), "下载直链分片").await?;
+            loop {
+                let Some(mut job) = pop_range_job(&queue).await else {
+                    break;
+                };
 
-            let mut file = File::options().write(true).open(output).await?;
-            file.seek(std::io::SeekFrom::Start(start)).await?;
-
-            while let Some(chunk) = response.chunk().await? {
                 wait_if_paused(&state, task_id).await?;
-                file.write_all(&chunk).await?;
-                add_downloaded(&state, task_id, chunk.len() as u64, total);
+                match download_range_part(
+                    &state,
+                    task_id,
+                    &client,
+                    headers.clone(),
+                    &url,
+                    &output,
+                    &job,
+                    total,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(err) => {
+                        job.attempts += 1;
+                        if job.attempts >= MAX_PART_ATTEMPTS {
+                            return Err(anyhow!(
+                                "Range 分片 {}-{} 多次重试后仍失败: {err}",
+                                job.start,
+                                job.end
+                            ));
+                        }
+                        note_part_deprioritized(
+                            &state,
+                            task_id,
+                            format!(
+                                "Range 分片 {}-{} 失败，已降低优先级稍后重试 ({}/{MAX_PART_ATTEMPTS})",
+                                job.start, job.end, job.attempts
+                            ),
+                        );
+                        push_range_job(&queue, job).await;
+                    }
+                }
             }
             Ok::<_, anyhow::Error>(())
         }));
@@ -477,6 +588,48 @@ async fn download_ranged(
         handle.await??;
     }
 
+    Ok(())
+}
+
+#[derive(Clone)]
+struct RangePartJob {
+    start: u64,
+    end: u64,
+    attempts: usize,
+}
+
+async fn pop_range_job(queue: &Mutex<VecDeque<RangePartJob>>) -> Option<RangePartJob> {
+    queue.lock().await.pop_front()
+}
+
+async fn push_range_job(queue: &Mutex<VecDeque<RangePartJob>>, job: RangePartJob) {
+    queue.lock().await.push_back(job);
+}
+
+async fn download_range_part(
+    state: &SharedState,
+    task_id: Uuid,
+    client: &Client,
+    mut headers: HeaderMap,
+    url: &str,
+    output: &PathBuf,
+    job: &RangePartJob,
+    total: u64,
+) -> anyhow::Result<()> {
+    headers.insert(
+        RANGE,
+        HeaderValue::from_str(&format!("bytes={}-{}", job.start, job.end))
+            .context("invalid range header")?,
+    );
+    let mut response = send_with_retry(client.get(url).headers(headers), "下载直链分片").await?;
+    let mut file = File::options().write(true).open(output).await?;
+    file.seek(std::io::SeekFrom::Start(job.start)).await?;
+
+    while let Some(chunk) = response.chunk().await? {
+        wait_if_paused(state, task_id).await?;
+        file.write_all(&chunk).await?;
+        add_downloaded(state, task_id, chunk.len() as u64, total);
+    }
     Ok(())
 }
 
@@ -562,6 +715,16 @@ fn mark_failed(state: &SharedState, task_id: Uuid, message: String) {
                 task.status = DownloadStatus::Failed;
                 task.message = message;
             }
+        }
+    });
+}
+
+fn note_part_deprioritized(state: &SharedState, task_id: Uuid, message: String) {
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id)
+            && task.status == DownloadStatus::Downloading
+        {
+            task.message = message;
         }
     });
 }
