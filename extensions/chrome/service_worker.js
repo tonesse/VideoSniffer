@@ -35,6 +35,12 @@ function headerValue(headers, name) {
   return (headers || []).find((header) => header.name.toLowerCase() === name)?.value;
 }
 
+function contentLength(headers) {
+  const value = headerValue(headers, "content-length");
+  const parsed = value ? Number.parseInt(value, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
 function captureForwardedHeaders(details) {
   const headers = (details.requestHeaders || [])
     .filter((header) => FORWARDED_REQUEST_HEADERS.has(header.name.toLowerCase()))
@@ -84,6 +90,7 @@ chrome.webRequest.onHeadersReceived.addListener(
       page_url: tab?.url || details.initiator || null,
       title: tab?.title || null,
       mime_type: headerValue(details.responseHeaders, "content-type") || null,
+      content_length: contentLength(details.responseHeaders),
       method: details.method,
       request_headers: [
         ...capturedHeaders,

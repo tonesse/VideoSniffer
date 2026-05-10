@@ -4,6 +4,7 @@ use crate::{
     sniffer::spawn_sniffer_server,
     state::{DownloadStatus, MediaItem, MediaType, Settings, SharedState},
 };
+use chrono::{DateTime, Local, Utc};
 use eframe::egui;
 use serde_json::Value;
 use std::{collections::HashSet, fs, path::PathBuf, sync::Arc};
@@ -15,6 +16,9 @@ enum AppView {
     Downloading,
     Completed,
 }
+
+const SNIFF_COLUMNS: [f32; 7] = [210.0, 70.0, 90.0, 90.0, 90.0, 300.0, 80.0];
+const TASK_COLUMNS: [f32; 8] = [220.0, 90.0, 80.0, 120.0, 90.0, 90.0, 150.0, 260.0];
 
 struct SettingsDraft {
     save_dir: String,
@@ -297,11 +301,6 @@ impl VideoSnifferApp {
                         self.set_view(AppView::Completed);
                     },
                 );
-                ui.separator();
-                ui.small("文件类型");
-                ui.label("  视频");
-                ui.label("  HLS");
-                ui.label("  MP4 / WEBM");
             });
     }
 
@@ -418,6 +417,7 @@ fn draw_sniffing_table(state: &SharedState, ui: &mut egui::Ui, active_view: &mut
     table_header(
         ui,
         &["文件名", "类型", "大小", "状态", "时间", "地址", "操作"],
+        &SNIFF_COLUMNS,
     );
 
     let items = state.read(|app| app.detected.iter().cloned().collect::<Vec<_>>());
@@ -430,17 +430,21 @@ fn draw_sniffing_table(state: &SharedState, ui: &mut egui::Ui, active_view: &mut
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new("sniffing_table")
-            .striped(true)
-            .spacing([14.0, 5.0])
-            .show(ui, |ui| {
-                for item in items {
-                    ui.label(compact_text(&item.title, 28));
-                    ui.label(item.media_type.label());
-                    ui.label("-");
-                    ui.label("已嗅探");
-                    ui.label(item.detected_at.format("%H:%M:%S").to_string());
-                    small_url_cell(ui, &item.url);
+        for item in items {
+            table_row(ui, &SNIFF_COLUMNS, |ui| {
+                table_cell(ui, SNIFF_COLUMNS[0], compact_text(&item.title, 28));
+                table_cell(ui, SNIFF_COLUMNS[1], item.media_type.label());
+                table_cell(
+                    ui,
+                    SNIFF_COLUMNS[2],
+                    item.content_length
+                        .map(human_bytes)
+                        .unwrap_or_else(|| "未知".to_string()),
+                );
+                table_cell(ui, SNIFF_COLUMNS[3], "已嗅探");
+                table_cell(ui, SNIFF_COLUMNS[4], local_time(item.detected_at));
+                url_cell(ui, SNIFF_COLUMNS[5], &item.url);
+                cell_ui(ui, SNIFF_COLUMNS[6], |ui| {
                     let supported = matches!(
                         item.media_type,
                         MediaType::Hls | MediaType::Mp4 | MediaType::Webm | MediaType::Unknown
@@ -454,20 +458,23 @@ fn draw_sniffing_table(state: &SharedState, ui: &mut egui::Ui, active_view: &mut
                         state.write(|app| app.detected.retain(|media| media.id != media_id));
                         *active_view = AppView::Downloading;
                     }
-                    ui.end_row();
-
-                    if item.media_type == MediaType::Hls {
-                        ui.label("");
-                        ui.label("");
-                        ui.label("");
-                        ui.label("");
-                        ui.label("");
-                        ui.horizontal(|ui| draw_hls_quality_selector(state, ui, &item));
-                        ui.label("");
-                        ui.end_row();
-                    }
-                }
+                });
             });
+
+            if item.media_type == MediaType::Hls {
+                table_row(ui, &SNIFF_COLUMNS, |ui| {
+                    table_cell(ui, SNIFF_COLUMNS[0], "");
+                    table_cell(ui, SNIFF_COLUMNS[1], "");
+                    table_cell(ui, SNIFF_COLUMNS[2], "");
+                    table_cell(ui, SNIFF_COLUMNS[3], "");
+                    table_cell(ui, SNIFF_COLUMNS[4], "");
+                    cell_ui(ui, SNIFF_COLUMNS[5], |ui| {
+                        draw_hls_quality_selector(state, ui, &item);
+                    });
+                    table_cell(ui, SNIFF_COLUMNS[6], "");
+                });
+            }
+        }
     });
 }
 
@@ -535,6 +542,7 @@ fn draw_task_table(
             "最后连接时间",
             "描述",
         ],
+        &TASK_COLUMNS,
     );
 
     let tasks = state.read(|app| {
@@ -562,70 +570,78 @@ fn draw_task_table(
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new(if completed_only {
-            "completed_table"
-        } else {
-            "downloading_table"
-        })
-        .striped(true)
-        .spacing([14.0, 5.0])
-        .show(ui, |ui| {
-            for task in tasks {
+        for task in tasks {
+            table_row(ui, &TASK_COLUMNS, |ui| {
                 let selected = *selected_task_id == Some(task.id);
                 if ui
-                    .selectable_label(selected, compact_text(&task.title, 28))
+                    .add_sized(
+                        [TASK_COLUMNS[0], 22.0],
+                        egui::Button::selectable(selected, compact_text(&task.title, 28))
+                            .frame(false),
+                    )
                     .clicked()
                 {
                     *selected_task_id = Some(task.id);
                 }
-                ui.label(
+                table_cell(
+                    ui,
+                    TASK_COLUMNS[1],
                     task.total_bytes
                         .map(human_bytes)
                         .unwrap_or_else(|| "-".to_string()),
                 );
-                status_label(ui, task.status);
-                ui.add(
-                    egui::ProgressBar::new(task.progress)
-                        .show_percentage()
-                        .desired_width(110.0),
+                cell_ui(ui, TASK_COLUMNS[2], |ui| {
+                    status_label(ui, task.status);
+                });
+                cell_ui(ui, TASK_COLUMNS[3], |ui| {
+                    ui.add(
+                        egui::ProgressBar::new(task.progress)
+                            .show_percentage()
+                            .desired_width(TASK_COLUMNS[3] - 8.0),
+                    );
+                });
+                table_cell(
+                    ui,
+                    TASK_COLUMNS[4],
+                    if task.status == DownloadStatus::Completed {
+                        "0 秒"
+                    } else {
+                        "-"
+                    },
                 );
-                ui.label(if task.status == DownloadStatus::Completed {
-                    "0 秒"
-                } else {
-                    "-"
+                table_cell(ui, TASK_COLUMNS[5], "-");
+                table_cell(ui, TASK_COLUMNS[6], "-");
+                cell_ui(ui, TASK_COLUMNS[7], |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(compact_text(&task.message, 24));
+                        if completed_only && ui.button("删除").clicked() {
+                            let id = task.id;
+                            state.write(|app| app.tasks.retain(|task| task.id != id));
+                            if *selected_task_id == Some(id) {
+                                *selected_task_id = None;
+                            }
+                        } else if !completed_only {
+                            if matches!(
+                                task.status,
+                                DownloadStatus::Queued | DownloadStatus::Downloading
+                            ) && ui.button("暂停").clicked()
+                            {
+                                pause_download(state.clone(), task.id);
+                            }
+                            if matches!(
+                                task.status,
+                                DownloadStatus::Paused
+                                    | DownloadStatus::Failed
+                                    | DownloadStatus::Queued
+                            ) && ui.button("继续").clicked()
+                            {
+                                resume_download(state.clone(), task.id);
+                            }
+                        }
+                    });
                 });
-                ui.label("-");
-                ui.label("-");
-                ui.horizontal(|ui| {
-                    ui.label(compact_text(&task.message, 34));
-                    if completed_only && ui.button("删除").clicked() {
-                        let id = task.id;
-                        state.write(|app| app.tasks.retain(|task| task.id != id));
-                        if *selected_task_id == Some(id) {
-                            *selected_task_id = None;
-                        }
-                    } else if !completed_only {
-                        if matches!(
-                            task.status,
-                            DownloadStatus::Queued | DownloadStatus::Downloading
-                        ) && ui.button("暂停").clicked()
-                        {
-                            pause_download(state.clone(), task.id);
-                        }
-                        if matches!(
-                            task.status,
-                            DownloadStatus::Paused
-                                | DownloadStatus::Failed
-                                | DownloadStatus::Queued
-                        ) && ui.button("继续").clicked()
-                        {
-                            resume_download(state.clone(), task.id);
-                        }
-                    }
-                });
-                ui.end_row();
-            }
-        });
+            });
+        }
     });
 
     if !completed_only {
@@ -828,7 +844,7 @@ fn read_manifest_summary(path: &PathBuf) -> Option<ManifestSummary> {
     })
 }
 
-fn table_header(ui: &mut egui::Ui, columns: &[&str]) {
+fn table_header(ui: &mut egui::Ui, columns: &[&str], widths: &[f32]) {
     egui::Frame::default()
         .fill(egui::Color32::from_rgb(245, 245, 245))
         .stroke(egui::Stroke::new(
@@ -838,16 +854,57 @@ fn table_header(ui: &mut egui::Ui, columns: &[&str]) {
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                for column in columns {
-                    ui.add_sized([120.0, 18.0], egui::Label::new(*column));
+                for (column, width) in columns.iter().zip(widths.iter()) {
+                    ui.add_sized([*width, 18.0], egui::Label::new(*column));
                 }
             });
         });
 }
 
+fn table_row(ui: &mut egui::Ui, widths: &[f32], add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::default()
+        .fill(egui::Color32::WHITE)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                add_contents(ui);
+                let used = widths.iter().sum::<f32>();
+                let remaining = (ui.available_width() - used).max(0.0);
+                if remaining > 0.0 {
+                    ui.add_space(remaining);
+                }
+            });
+        });
+}
+
+fn table_cell(ui: &mut egui::Ui, width: f32, text: impl Into<egui::WidgetText>) {
+    ui.add_sized([width, 22.0], egui::Label::new(text).truncate());
+}
+
+fn url_cell(ui: &mut egui::Ui, width: f32, url: &str) {
+    ui.add_sized(
+        [width, 22.0],
+        egui::Label::new(compact_text(url, 38)).truncate(),
+    )
+    .on_hover_text(url);
+}
+
+fn cell_ui(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 22.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        add_contents,
+    );
+}
+
 fn empty_row(ui: &mut egui::Ui, text: &str) {
     ui.add_space(12.0);
     ui.label(text);
+}
+
+fn local_time(time: DateTime<Utc>) -> String {
+    time.with_timezone(&Local).format("%H:%M:%S").to_string()
 }
 
 fn status_label(ui: &mut egui::Ui, status: DownloadStatus) {
@@ -893,11 +950,6 @@ fn load_system_chinese_font() -> Option<Vec<u8>> {
     ];
 
     candidates.iter().find_map(|path| fs::read(path).ok())
-}
-
-fn small_url_cell(ui: &mut egui::Ui, url: &str) {
-    ui.add(egui::Label::new(compact_text(url, 34)))
-        .on_hover_text(url);
 }
 
 fn compact_text(value: &str, max_chars: usize) -> String {
