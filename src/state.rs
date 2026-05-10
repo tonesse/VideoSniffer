@@ -172,6 +172,7 @@ pub struct DownloadTask {
     pub progress: f32,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
+    pub completed_segments: usize,
     pub message: String,
 }
 
