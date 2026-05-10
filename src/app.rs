@@ -1095,7 +1095,10 @@ fn table_cell(ui: &mut egui::Ui, width: f32, text: impl AsRef<str>) -> egui::Res
 }
 
 fn copyable_table_cell(ui: &mut egui::Ui, width: f32, text: &str) -> egui::Response {
-    let response = table_cell(ui, width, text);
+    let response = interactive_table_cell(ui, width, text);
+    if response.clicked() {
+        ui.ctx().copy_text(text.to_string());
+    }
     response.context_menu(|ui| {
         if ui.button("复制地址").clicked() {
             ui.ctx().copy_text(text.to_string());
@@ -1103,6 +1106,30 @@ fn copyable_table_cell(ui: &mut egui::Ui, width: f32, text: &str) -> egui::Respo
         }
     });
     response
+}
+
+fn interactive_table_cell(ui: &mut egui::Ui, width: f32, text: &str) -> egui::Response {
+    let (display, truncated) = elide_to_width(ui, text, width - 8.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(238, 246, 252));
+    }
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.text(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        display,
+        egui::TextStyle::Body.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+
+    let response = response.on_hover_text("单击复制地址，右键打开菜单");
+    if truncated {
+        response.on_hover_text(format!("{text}\n\n单击复制地址，右键打开菜单"))
+    } else {
+        response
+    }
 }
 
 fn selectable_table_cell(
