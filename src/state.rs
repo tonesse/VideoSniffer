@@ -99,7 +99,49 @@ pub struct MediaItem {
     pub title: String,
     pub media_type: MediaType,
     pub headers: Vec<HeaderPair>,
+    pub hls_variants: Vec<HlsVariant>,
+    pub selected_hls_variant_url: Option<String>,
+    pub hls_status: Option<String>,
     pub detected_at: DateTime<Utc>,
+}
+
+impl MediaItem {
+    pub fn selected_hls_url(&self) -> String {
+        if self.media_type != MediaType::Hls {
+            return self.url.clone();
+        }
+
+        self.selected_hls_variant_url
+            .clone()
+            .or_else(|| self.hls_variants.first().map(|variant| variant.url.clone()))
+            .unwrap_or_else(|| self.url.clone())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HlsVariant {
+    pub url: String,
+    pub bandwidth: Option<u64>,
+    pub resolution: Option<String>,
+    pub codecs: Option<String>,
+}
+
+impl HlsVariant {
+    pub fn label(&self) -> String {
+        let quality = match (self.resolution.as_deref(), self.bandwidth) {
+            (Some(resolution), Some(bandwidth)) => {
+                format!("{resolution} · {}", bitrate_label(bandwidth))
+            }
+            (Some(resolution), None) => resolution.to_string(),
+            (None, Some(bandwidth)) => bitrate_label(bandwidth),
+            (None, None) => "自动清晰度".to_string(),
+        };
+
+        match &self.codecs {
+            Some(codecs) if !codecs.is_empty() => format!("{quality} · {codecs}"),
+            _ => quality,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +198,9 @@ impl From<MediaCandidate> for MediaItem {
             title,
             media_type,
             headers: candidate.request_headers,
+            hls_variants: Vec::new(),
+            selected_hls_variant_url: None,
+            hls_status: None,
             detected_at: Utc::now(),
         }
     }
@@ -205,4 +250,14 @@ pub fn filename_from_url(url: &str) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("video")
         .to_string()
+}
+
+fn bitrate_label(bits_per_second: u64) -> String {
+    if bits_per_second >= 1_000_000 {
+        format!("{:.1} Mbps", bits_per_second as f64 / 1_000_000.0)
+    } else if bits_per_second >= 1_000 {
+        format!("{:.0} Kbps", bits_per_second as f64 / 1_000.0)
+    } else {
+        format!("{bits_per_second} bps")
+    }
 }

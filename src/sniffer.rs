@@ -1,4 +1,7 @@
-use crate::state::{MediaCandidate, MediaItem, SharedState};
+use crate::{
+    hls::spawn_hls_variant_analysis,
+    state::{MediaCandidate, MediaItem, MediaType, SharedState},
+};
 use axum::{
     Json, Router,
     extract::State,
@@ -58,7 +61,7 @@ async fn receive_media(
         return with_cors((StatusCode::NO_CONTENT, "ignored"));
     }
 
-    state.write(|app| {
+    let hls_media_id = state.write(|app| {
         if let Some(item) = app
             .detected
             .iter_mut()
@@ -77,14 +80,24 @@ async fn receive_media(
             {
                 item.title = title.clone();
             }
-            return;
+            if item.media_type == MediaType::Hls && item.hls_variants.is_empty() {
+                return Some(item.id);
+            }
+            return None;
         }
 
-        app.detected.push_front(MediaItem::from(candidate));
+        let item = MediaItem::from(candidate);
+        let hls_media_id = (item.media_type == MediaType::Hls).then_some(item.id);
+        app.detected.push_front(item);
         while app.detected.len() > 200 {
             app.detected.pop_back();
         }
+        hls_media_id
     });
+
+    if let Some(media_id) = hls_media_id {
+        spawn_hls_variant_analysis(state, media_id);
+    }
 
     with_cors((StatusCode::CREATED, "accepted"))
 }
