@@ -274,7 +274,7 @@ impl VideoSnifferApp {
     }
 
     fn draw_left_categories(&mut self, ctx: &egui::Context) {
-        let (detected, running, completed, all) = self.state.read(|app| {
+        let (detected, running, completed) = self.state.read(|app| {
             let running = app
                 .tasks
                 .iter()
@@ -285,7 +285,7 @@ impl VideoSnifferApp {
                 .iter()
                 .filter(|task| task.status == DownloadStatus::Completed)
                 .count();
-            (app.detected.len(), running, completed, app.tasks.len())
+            (app.detected.len(), running, completed)
         });
 
         egui::SidePanel::left("categories")
@@ -299,15 +299,9 @@ impl VideoSnifferApp {
                     )),
             )
             .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("分类");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label("x");
-                    });
-                });
+                ui.add_space(6.0);
+                ui.label("分类");
                 ui.separator();
-                ui.small(format!("全部任务: {all}"));
                 category_row(
                     ui,
                     "嗅探资源",
