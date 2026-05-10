@@ -81,6 +81,9 @@ async fn receive_media(
             {
                 item.title = title.clone();
             }
+            if candidate.content_length.is_some() {
+                item.content_length = candidate.content_length;
+            }
             if item.media_type == MediaType::Hls && item.hls_variants.is_empty() {
                 return Some(item.id);
             }

@@ -179,6 +179,8 @@ pub struct MediaCandidate {
     pub page_url: Option<String>,
     pub title: Option<String>,
     pub mime_type: Option<String>,
+    #[serde(default)]
+    pub content_length: Option<u64>,
     pub method: Option<String>,
     pub request_headers: Vec<HeaderPair>,
 }
@@ -196,6 +198,8 @@ pub struct MediaItem {
     pub page_url: Option<String>,
     pub title: String,
     pub media_type: MediaType,
+    #[serde(default)]
+    pub content_length: Option<u64>,
     pub headers: Vec<HeaderPair>,
     pub hls_variants: Vec<HlsVariant>,
     pub selected_hls_variant_url: Option<String>,
@@ -295,6 +299,7 @@ impl From<MediaCandidate> for MediaItem {
             page_url: candidate.page_url,
             title,
             media_type,
+            content_length: candidate.content_length,
             headers: candidate.request_headers,
             hls_variants: Vec::new(),
             selected_hls_variant_url: None,
