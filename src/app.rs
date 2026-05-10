@@ -17,8 +17,8 @@ enum AppView {
     Completed,
 }
 
-const SNIFF_COLUMNS: [f32; 7] = [210.0, 70.0, 90.0, 90.0, 90.0, 300.0, 80.0];
-const TASK_COLUMNS: [f32; 8] = [220.0, 90.0, 80.0, 120.0, 90.0, 90.0, 150.0, 260.0];
+const DEFAULT_SNIFF_COLUMNS: [f32; 7] = [210.0, 70.0, 90.0, 90.0, 90.0, 300.0, 80.0];
+const DEFAULT_TASK_COLUMNS: [f32; 8] = [220.0, 90.0, 80.0, 120.0, 90.0, 90.0, 150.0, 260.0];
 
 struct SettingsDraft {
     save_dir: String,
@@ -47,6 +47,8 @@ pub struct VideoSnifferApp {
     active_view: AppView,
     show_settings: bool,
     settings_draft: SettingsDraft,
+    sniff_columns: [f32; 7],
+    task_columns: [f32; 8],
     last_revision: u64,
     selected_task_id: Option<Uuid>,
 }
@@ -65,6 +67,8 @@ impl VideoSnifferApp {
             active_view: AppView::Sniffing,
             show_settings: false,
             settings_draft: SettingsDraft::from_settings(&settings),
+            sniff_columns: DEFAULT_SNIFF_COLUMNS,
+            task_columns: DEFAULT_TASK_COLUMNS,
             last_revision: 0,
             selected_task_id: None,
         }
@@ -148,13 +152,26 @@ impl eframe::App for VideoSnifferApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::WHITE))
             .show(ctx, |ui| match self.active_view {
-                AppView::Sniffing => draw_sniffing_table(&self.state, ui, &mut self.active_view),
-                AppView::Downloading => {
-                    draw_task_table(&self.state, ui, &mut self.selected_task_id, false)
-                }
-                AppView::Completed => {
-                    draw_task_table(&self.state, ui, &mut self.selected_task_id, true)
-                }
+                AppView::Sniffing => draw_sniffing_table(
+                    &self.state,
+                    ui,
+                    &mut self.active_view,
+                    &mut self.sniff_columns,
+                ),
+                AppView::Downloading => draw_task_table(
+                    &self.state,
+                    ui,
+                    &mut self.selected_task_id,
+                    false,
+                    &mut self.task_columns,
+                ),
+                AppView::Completed => draw_task_table(
+                    &self.state,
+                    ui,
+                    &mut self.selected_task_id,
+                    true,
+                    &mut self.task_columns,
+                ),
             });
     }
 }
@@ -413,11 +430,16 @@ fn category_row(
     }
 }
 
-fn draw_sniffing_table(state: &SharedState, ui: &mut egui::Ui, active_view: &mut AppView) {
+fn draw_sniffing_table(
+    state: &SharedState,
+    ui: &mut egui::Ui,
+    active_view: &mut AppView,
+    columns: &mut [f32; 7],
+) {
     table_header(
         ui,
         &["文件名", "类型", "大小", "状态", "时间", "地址", "操作"],
-        &SNIFF_COLUMNS,
+        columns,
     );
 
     let items = state.read(|app| app.detected.iter().cloned().collect::<Vec<_>>());
@@ -431,20 +453,20 @@ fn draw_sniffing_table(state: &SharedState, ui: &mut egui::Ui, active_view: &mut
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         for item in items {
-            table_row(ui, &SNIFF_COLUMNS, |ui| {
-                table_cell(ui, SNIFF_COLUMNS[0], compact_text(&item.title, 28));
-                table_cell(ui, SNIFF_COLUMNS[1], item.media_type.label());
+            table_row(ui, columns, |ui| {
+                table_cell(ui, columns[0], compact_text(&item.title, 28));
+                table_cell(ui, columns[1], item.media_type.label());
                 table_cell(
                     ui,
-                    SNIFF_COLUMNS[2],
+                    columns[2],
                     item.content_length
                         .map(human_bytes)
                         .unwrap_or_else(|| "未知".to_string()),
                 );
-                table_cell(ui, SNIFF_COLUMNS[3], "已嗅探");
-                table_cell(ui, SNIFF_COLUMNS[4], local_time(item.detected_at));
-                url_cell(ui, SNIFF_COLUMNS[5], &item.url);
-                cell_ui(ui, SNIFF_COLUMNS[6], |ui| {
+                table_cell(ui, columns[3], "已嗅探");
+                table_cell(ui, columns[4], local_time(item.detected_at));
+                url_cell(ui, columns[5], &item.url);
+                cell_ui(ui, columns[6], |ui| {
                     let supported = matches!(
                         item.media_type,
                         MediaType::Hls | MediaType::Mp4 | MediaType::Webm | MediaType::Unknown
@@ -462,16 +484,16 @@ fn draw_sniffing_table(state: &SharedState, ui: &mut egui::Ui, active_view: &mut
             });
 
             if item.media_type == MediaType::Hls {
-                table_row(ui, &SNIFF_COLUMNS, |ui| {
-                    table_cell(ui, SNIFF_COLUMNS[0], "");
-                    table_cell(ui, SNIFF_COLUMNS[1], "");
-                    table_cell(ui, SNIFF_COLUMNS[2], "");
-                    table_cell(ui, SNIFF_COLUMNS[3], "");
-                    table_cell(ui, SNIFF_COLUMNS[4], "");
-                    cell_ui(ui, SNIFF_COLUMNS[5], |ui| {
+                table_row(ui, columns, |ui| {
+                    table_cell(ui, columns[0], "");
+                    table_cell(ui, columns[1], "");
+                    table_cell(ui, columns[2], "");
+                    table_cell(ui, columns[3], "");
+                    table_cell(ui, columns[4], "");
+                    cell_ui(ui, columns[5], |ui| {
                         draw_hls_quality_selector(state, ui, &item);
                     });
-                    table_cell(ui, SNIFF_COLUMNS[6], "");
+                    table_cell(ui, columns[6], "");
                 });
             }
         }
@@ -529,6 +551,7 @@ fn draw_task_table(
     ui: &mut egui::Ui,
     selected_task_id: &mut Option<Uuid>,
     completed_only: bool,
+    columns: &mut [f32; 8],
 ) {
     table_header(
         ui,
@@ -542,7 +565,7 @@ fn draw_task_table(
             "最后连接时间",
             "描述",
         ],
-        &TASK_COLUMNS,
+        columns,
     );
 
     let tasks = state.read(|app| {
@@ -571,11 +594,11 @@ fn draw_task_table(
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         for task in tasks {
-            table_row(ui, &TASK_COLUMNS, |ui| {
+            table_row(ui, columns, |ui| {
                 let selected = *selected_task_id == Some(task.id);
                 if ui
                     .add_sized(
-                        [TASK_COLUMNS[0], 22.0],
+                        [columns[0], 22.0],
                         egui::Button::selectable(selected, compact_text(&task.title, 28))
                             .frame(false),
                     )
@@ -585,33 +608,33 @@ fn draw_task_table(
                 }
                 table_cell(
                     ui,
-                    TASK_COLUMNS[1],
+                    columns[1],
                     task.total_bytes
                         .map(human_bytes)
                         .unwrap_or_else(|| "-".to_string()),
                 );
-                cell_ui(ui, TASK_COLUMNS[2], |ui| {
+                cell_ui(ui, columns[2], |ui| {
                     status_label(ui, task.status);
                 });
-                cell_ui(ui, TASK_COLUMNS[3], |ui| {
+                cell_ui(ui, columns[3], |ui| {
                     ui.add(
                         egui::ProgressBar::new(task.progress)
                             .show_percentage()
-                            .desired_width(TASK_COLUMNS[3] - 8.0),
+                            .desired_width(columns[3] - 8.0),
                     );
                 });
                 table_cell(
                     ui,
-                    TASK_COLUMNS[4],
+                    columns[4],
                     if task.status == DownloadStatus::Completed {
                         "0 秒"
                     } else {
                         "-"
                     },
                 );
-                table_cell(ui, TASK_COLUMNS[5], "-");
-                table_cell(ui, TASK_COLUMNS[6], "-");
-                cell_ui(ui, TASK_COLUMNS[7], |ui| {
+                table_cell(ui, columns[5], "-");
+                table_cell(ui, columns[6], "-");
+                cell_ui(ui, columns[7], |ui| {
                     ui.horizontal(|ui| {
                         ui.label(compact_text(&task.message, 24));
                         if completed_only && ui.button("删除").clicked() {
@@ -844,7 +867,7 @@ fn read_manifest_summary(path: &PathBuf) -> Option<ManifestSummary> {
     })
 }
 
-fn table_header(ui: &mut egui::Ui, columns: &[&str], widths: &[f32]) {
+fn table_header(ui: &mut egui::Ui, columns: &[&str], widths: &mut [f32]) {
     egui::Frame::default()
         .fill(egui::Color32::from_rgb(245, 245, 245))
         .stroke(egui::Stroke::new(
@@ -854,8 +877,34 @@ fn table_header(ui: &mut egui::Ui, columns: &[&str], widths: &[f32]) {
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                for (column, width) in columns.iter().zip(widths.iter()) {
-                    ui.add_sized([*width, 18.0], egui::Label::new(*column));
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (index, column) in columns.iter().enumerate() {
+                    let response =
+                        ui.add_sized([widths[index], 18.0], egui::Label::new(*column).truncate());
+                    if index + 1 < columns.len() {
+                        let rect = egui::Rect::from_min_max(
+                            egui::pos2(response.rect.right() - 3.0, response.rect.top()),
+                            egui::pos2(response.rect.right() + 4.0, response.rect.bottom()),
+                        );
+                        let drag = ui.interact(
+                            rect,
+                            ui.id().with(("column_resize", index)),
+                            egui::Sense::click_and_drag(),
+                        );
+                        ui.painter().line_segment(
+                            [rect.center_top(), rect.center_bottom()],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(190, 190, 190)),
+                        );
+                        if drag.hovered() || drag.dragged() {
+                            ui.output_mut(|output| {
+                                output.cursor_icon = egui::CursorIcon::ResizeHorizontal;
+                            });
+                        }
+                        if drag.dragged() {
+                            let delta = ui.input(|input| input.pointer.delta().x);
+                            widths[index] = (widths[index] + delta).clamp(48.0, 620.0);
+                        }
+                    }
                 }
             });
         });
