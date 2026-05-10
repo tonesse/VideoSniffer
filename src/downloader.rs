@@ -3,7 +3,7 @@ use crate::{
         HlsKey, HlsKeyMethod, HlsSegment, choose_highest_variant, parse_hls_playlist,
         sort_variants_highest_first,
     },
-    net::{build_client, bytes_with_retry, send_with_retry, text_with_retry},
+    net::{build_client, bytes_with_retry, send_with_retry, set_retry_attempts, text_with_retry},
     state::{
         DownloadStatus, DownloadTask, HeaderPair, MediaItem, MediaType, SharedState,
         filename_from_url,
@@ -34,7 +34,6 @@ use tokio::{
 use uuid::Uuid;
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
-const MAX_PART_ATTEMPTS: usize = 5;
 
 pub fn enqueue_download(state: SharedState, media: &MediaItem) {
     let task = DownloadTask {
@@ -131,20 +130,24 @@ fn spawn_download_worker(state: SharedState, task_id: Uuid) {
 }
 
 async fn run_task(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
-    let (task, save_dir, part_threads, headers) = state.read(|app| {
-        let task = app
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .cloned()
-            .expect("task exists");
-        (
-            task.clone(),
-            app.settings.save_dir.clone(),
-            app.settings.part_threads,
-            task.headers.clone(),
-        )
-    });
+    let (task, save_dir, part_threads, headers, request_retry_attempts, part_retry_attempts) =
+        state.read(|app| {
+            let task = app
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .cloned()
+                .expect("task exists");
+            (
+                task.clone(),
+                app.settings.save_dir.clone(),
+                app.settings.part_threads,
+                task.headers.clone(),
+                app.settings.request_retry_attempts,
+                app.settings.part_retry_attempts.max(1),
+            )
+        });
+    set_retry_attempts(request_retry_attempts);
 
     if task.media_type == MediaType::Hls {
         return download_hls(state, task_id).await;
@@ -214,6 +217,7 @@ async fn run_task(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
                 output,
                 total,
                 part_threads,
+                part_retry_attempts,
             )
             .await?;
         }
@@ -227,20 +231,24 @@ async fn run_task(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
 }
 
 async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
-    let (task, save_dir, part_threads, headers) = state.read(|app| {
-        let task = app
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .cloned()
-            .expect("task exists");
-        (
-            task.clone(),
-            app.settings.save_dir.clone(),
-            app.settings.part_threads.max(1),
-            task.headers.clone(),
-        )
-    });
+    let (task, save_dir, part_threads, headers, request_retry_attempts, part_retry_attempts) =
+        state.read(|app| {
+            let task = app
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .cloned()
+                .expect("task exists");
+            (
+                task.clone(),
+                app.settings.save_dir.clone(),
+                app.settings.part_threads.max(1),
+                task.headers.clone(),
+                app.settings.request_retry_attempts,
+                app.settings.part_retry_attempts.max(1),
+            )
+        });
+    set_retry_attempts(request_retry_attempts);
 
     state.write(|app| {
         if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
@@ -360,7 +368,7 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
                     Ok(()) => {}
                     Err(err) => {
                         job.attempts += 1;
-                        if job.attempts >= MAX_PART_ATTEMPTS {
+                        if job.attempts >= part_retry_attempts {
                             return Err(anyhow!(
                                 "HLS 分片 #{} 多次重试后仍失败: {err}",
                                 job.index + 1
@@ -370,9 +378,10 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
                             &state,
                             task_id,
                             format!(
-                                "HLS 分片 #{} 失败，已降低优先级稍后重试 ({}/{MAX_PART_ATTEMPTS})",
+                                "HLS 分片 #{} 失败，已降低优先级稍后重试 ({}/{})",
                                 job.index + 1,
-                                job.attempts
+                                job.attempts,
+                                part_retry_attempts
                             ),
                         );
                         push_hls_job(&queue, job).await;
@@ -542,6 +551,7 @@ async fn download_ranged(
     output: PathBuf,
     total: u64,
     part_threads: usize,
+    part_retry_attempts: usize,
 ) -> anyhow::Result<()> {
     let file = File::create(&output).await?;
     file.set_len(total).await?;
@@ -625,7 +635,7 @@ async fn download_ranged(
                     Ok(()) => {}
                     Err(err) => {
                         job.attempts += 1;
-                        if job.attempts >= MAX_PART_ATTEMPTS {
+                        if job.attempts >= part_retry_attempts {
                             return Err(anyhow!(
                                 "Range 分片 {}-{} 多次重试后仍失败: {err}",
                                 job.start,
@@ -636,8 +646,8 @@ async fn download_ranged(
                             &state,
                             task_id,
                             format!(
-                                "Range 分片 {}-{} 失败，已降低优先级稍后重试 ({}/{MAX_PART_ATTEMPTS})",
-                                job.start, job.end, job.attempts
+                                "Range 分片 {}-{} 失败，已降低优先级稍后重试 ({}/{})",
+                                job.start, job.end, job.attempts, part_retry_attempts
                             ),
                         );
                         push_range_job(&queue, job).await;
