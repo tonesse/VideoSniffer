@@ -11,6 +11,7 @@ Rust Windows desktop app prototype for browser video sniffing and multi-threaded
 - Downloader supports direct MP4/WEBM/unknown file URLs with ranged multi-thread download when the server supports `Accept-Ranges: bytes`.
 - HLS media playlists are downloaded by fetching segments concurrently and merging them into a `.ts` output file.
 - HLS master playlists are analyzed automatically. The app defaults to the highest bitrate variant and lets the user switch quality in the UI before downloading.
+- Non-DRM HLS `EXT-X-KEY:METHOD=AES-128` streams are decrypted when the playlist exposes the key URL and IV.
 - DASH parsing is intentionally separated for the next step.
 
 ## Run
@@ -37,9 +38,9 @@ cargo run
 - Multi-thread ranged download for direct media files.
 - Non-encrypted HLS media playlist segment download and merge.
 - HLS master playlist quality discovery, highest-bitrate default selection, and manual quality switching.
+- AES-128 HLS segment decryption using playlist-provided `EXT-X-KEY` metadata.
 
 ## Next Implementation Step
 
-- Add encrypted HLS key handling where allowed by the source.
-- Preserve cookies and richer request headers from extension.
+- Improve HLS output container handling and optional remuxing.
 - Add pause/resume and persisted task database.

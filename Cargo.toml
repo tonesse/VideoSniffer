@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+aes = "0.8"
 axum = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
 eframe = "0.33"
