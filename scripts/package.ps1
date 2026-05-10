@@ -39,6 +39,17 @@ if (-not $SkipBuild) {
     cargo build --release
 }
 
+$ExistingPackagedExe = Join-Path $PackageRoot "$AppName.exe"
+if (Test-Path -LiteralPath $ExistingPackagedExe) {
+    $RunningPackagedApp = Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $ExistingPackagedExe } |
+        Select-Object -First 1
+
+    if ($RunningPackagedApp) {
+        throw "Packaged app is running. Close $ExistingPackagedExe before packaging again."
+    }
+}
+
 Reset-Directory $PackageRoot
 New-Item -ItemType Directory -Force -Path $AppBinDir | Out-Null
 
