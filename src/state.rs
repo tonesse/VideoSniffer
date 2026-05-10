@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
+    fs,
     path::PathBuf,
     sync::{
         Arc,
@@ -15,29 +16,33 @@ use uuid::Uuid;
 pub struct SharedState {
     inner: Arc<Mutex<AppState>>,
     revision: Arc<AtomicU64>,
+    persist_path: Arc<PathBuf>,
+    active_tasks: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl SharedState {
     pub fn new() -> Self {
-        let download_dir = dirs::video_dir()
-            .or_else(dirs::download_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("VideoSniffer");
+        let persist_path = state_file_path();
+        let mut app_state = load_state(&persist_path).unwrap_or_else(default_state);
 
-        Self {
-            inner: Arc::new(Mutex::new(AppState {
-                detected: VecDeque::new(),
-                tasks: Vec::new(),
-                settings: Settings {
-                    save_dir: download_dir,
-                    max_tasks: 3,
-                    part_threads: 8,
-                    min_media_size_mb: 10,
-                    listen_port: 37651,
-                },
-            })),
-            revision: Arc::new(AtomicU64::new(1)),
+        for task in &mut app_state.tasks {
+            if matches!(
+                task.status,
+                DownloadStatus::Downloading | DownloadStatus::Queued
+            ) {
+                task.status = DownloadStatus::Paused;
+                task.message = "应用已重启，点击恢复可重新开始下载".to_string();
+            }
         }
+
+        let state = Self {
+            inner: Arc::new(Mutex::new(app_state)),
+            revision: Arc::new(AtomicU64::new(1)),
+            persist_path: Arc::new(persist_path),
+            active_tasks: Arc::new(Mutex::new(HashSet::new())),
+        };
+        state.persist();
+        state
     }
 
     pub fn read<R>(&self, f: impl FnOnce(&AppState) -> R) -> R {
@@ -45,8 +50,13 @@ impl SharedState {
     }
 
     pub fn write<R>(&self, f: impl FnOnce(&mut AppState) -> R) -> R {
-        let result = f(&mut self.inner.lock());
+        let (result, snapshot) = {
+            let mut guard = self.inner.lock();
+            let result = f(&mut guard);
+            (result, guard.clone())
+        };
         self.bump();
+        self.persist_snapshot(&snapshot);
         result
     }
 
@@ -57,16 +67,74 @@ impl SharedState {
     pub fn bump(&self) {
         self.revision.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn mark_task_active(&self, task_id: Uuid) -> bool {
+        self.active_tasks.lock().insert(task_id)
+    }
+
+    pub fn mark_task_inactive(&self, task_id: Uuid) {
+        self.active_tasks.lock().remove(&task_id);
+    }
+
+    pub fn is_task_active(&self, task_id: Uuid) -> bool {
+        self.active_tasks.lock().contains(&task_id)
+    }
+
+    fn persist(&self) {
+        let snapshot = self.inner.lock().clone();
+        self.persist_snapshot(&snapshot);
+    }
+
+    fn persist_snapshot(&self, snapshot: &AppState) {
+        if let Some(parent) = self.persist_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(snapshot) {
+            let _ = fs::write(self.persist_path.as_ref(), json);
+        }
+    }
 }
 
-#[derive(Clone)]
+fn default_state() -> AppState {
+    let download_dir = dirs::video_dir()
+        .or_else(dirs::download_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("VideoSniffer");
+
+    AppState {
+        detected: VecDeque::new(),
+        tasks: Vec::new(),
+        settings: Settings {
+            save_dir: download_dir,
+            max_tasks: 3,
+            part_threads: 8,
+            min_media_size_mb: 10,
+            listen_port: 37651,
+        },
+    }
+}
+
+fn load_state(path: &PathBuf) -> Option<AppState> {
+    let json = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+fn state_file_path() -> PathBuf {
+    dirs::config_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("VideoSniffer")
+        .join("state.json")
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AppState {
     pub detected: VecDeque<MediaItem>,
     pub tasks: Vec<DownloadTask>,
     pub settings: Settings,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Settings {
     pub save_dir: PathBuf,
     pub max_tasks: usize,
@@ -91,7 +159,7 @@ pub struct HeaderPair {
     pub value: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct MediaItem {
     pub id: Uuid,
     pub url: String,
@@ -118,7 +186,7 @@ impl MediaItem {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HlsVariant {
     pub url: String,
     pub bandwidth: Option<u64>,
@@ -144,7 +212,7 @@ impl HlsVariant {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum MediaType {
     Hls,
     Dash,
@@ -206,13 +274,14 @@ impl From<MediaCandidate> for MediaItem {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct DownloadTask {
     pub id: Uuid,
     pub media_id: Uuid,
     pub title: String,
     pub url: String,
     pub media_type: MediaType,
+    pub headers: Vec<HeaderPair>,
     pub status: DownloadStatus,
     pub progress: f32,
     pub downloaded_bytes: u64,
@@ -221,10 +290,11 @@ pub struct DownloadTask {
     pub message: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 pub enum DownloadStatus {
     Queued,
     Downloading,
+    Paused,
     Completed,
     Failed,
     Unsupported,
@@ -235,6 +305,7 @@ impl DownloadStatus {
         match self {
             Self::Queued => "等待中",
             Self::Downloading => "下载中",
+            Self::Paused => "已暂停",
             Self::Completed => "已完成",
             Self::Failed => "失败",
             Self::Unsupported => "暂不支持",

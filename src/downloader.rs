@@ -21,6 +21,7 @@ use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{Mutex, Semaphore},
+    time::{Duration, sleep},
 };
 use uuid::Uuid;
 
@@ -33,6 +34,7 @@ pub fn enqueue_download(state: SharedState, media: &MediaItem) {
         title: media.title.clone(),
         url: media.selected_hls_url(),
         media_type: media.media_type,
+        headers: media.headers.clone(),
         status: DownloadStatus::Queued,
         progress: 0.0,
         downloaded_bytes: 0,
@@ -41,9 +43,61 @@ pub fn enqueue_download(state: SharedState, media: &MediaItem) {
         message: "等待下载".to_string(),
     };
     let task_id = task.id;
-    let headers = media.headers.clone();
 
     state.write(|app| app.tasks.push(task));
+    spawn_download_worker(state, task_id);
+}
+
+pub fn pause_download(state: SharedState, task_id: Uuid) {
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id)
+            && matches!(
+                task.status,
+                DownloadStatus::Queued | DownloadStatus::Downloading
+            )
+        {
+            task.status = DownloadStatus::Paused;
+            task.message = "已暂停".to_string();
+        }
+    });
+}
+
+pub fn resume_download(state: SharedState, task_id: Uuid) {
+    let should_spawn = state.write(|app| {
+        let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) else {
+            return false;
+        };
+
+        if matches!(
+            task.status,
+            DownloadStatus::Completed | DownloadStatus::Unsupported
+        ) {
+            return false;
+        }
+
+        let was_failed = task.status == DownloadStatus::Failed;
+        task.status = DownloadStatus::Downloading;
+        task.message = "正在恢复下载".to_string();
+
+        if was_failed || task.progress >= 1.0 {
+            task.progress = 0.0;
+            task.downloaded_bytes = 0;
+            task.completed_segments = 0;
+            task.total_bytes = None;
+        }
+
+        true
+    });
+
+    if should_spawn && !state.is_task_active(task_id) {
+        spawn_download_worker(state, task_id);
+    }
+}
+
+fn spawn_download_worker(state: SharedState, task_id: Uuid) {
+    if !state.mark_task_active(task_id) {
+        return;
+    }
 
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -53,24 +107,22 @@ pub fn enqueue_download(state: SharedState, media: &MediaItem) {
             Ok(runtime) => runtime,
             Err(err) => {
                 mark_failed(&state, task_id, format!("无法启动下载运行时: {err}"));
+                state.mark_task_inactive(task_id);
                 return;
             }
         };
 
         runtime.block_on(async move {
-            if let Err(err) = run_task(state.clone(), task_id, headers).await {
+            if let Err(err) = run_task(state.clone(), task_id).await {
                 mark_failed(&state, task_id, err.to_string());
             }
+            state.mark_task_inactive(task_id);
         });
     });
 }
 
-async fn run_task(
-    state: SharedState,
-    task_id: Uuid,
-    headers: Vec<HeaderPair>,
-) -> anyhow::Result<()> {
-    let (task, save_dir, part_threads) = state.read(|app| {
+async fn run_task(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
+    let (task, save_dir, part_threads, headers) = state.read(|app| {
         let task = app
             .tasks
             .iter()
@@ -78,14 +130,15 @@ async fn run_task(
             .cloned()
             .expect("task exists");
         (
-            task,
+            task.clone(),
             app.settings.save_dir.clone(),
             app.settings.part_threads,
+            task.headers.clone(),
         )
     });
 
     if task.media_type == MediaType::Hls {
-        return download_hls(state, task_id, headers).await;
+        return download_hls(state, task_id).await;
     }
 
     if !matches!(
@@ -108,6 +161,7 @@ async fn run_task(
         }
     });
 
+    wait_if_paused(&state, task_id).await?;
     fs::create_dir_all(&save_dir).await?;
     let client = Client::builder().build()?;
     let header_map = to_header_map(&headers);
@@ -139,9 +193,7 @@ async fn run_task(
         }
     });
 
-    let filename = output_filename(&task);
-    let output = save_dir.join(filename);
-
+    let output = save_dir.join(output_filename(&task));
     match (total, accepts_ranges && part_threads > 1) {
         (Some(total), true) if total > 1024 * 1024 => {
             download_ranged(
@@ -161,23 +213,12 @@ async fn run_task(
         }
     }
 
-    state.write(|app| {
-        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
-            task.status = DownloadStatus::Completed;
-            task.progress = 1.0;
-            task.message = "下载完成".to_string();
-        }
-    });
-
+    mark_completed(&state, task_id, "下载完成".to_string());
     Ok(())
 }
 
-async fn download_hls(
-    state: SharedState,
-    task_id: Uuid,
-    headers: Vec<HeaderPair>,
-) -> anyhow::Result<()> {
-    let (task, save_dir, part_threads) = state.read(|app| {
+async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
+    let (task, save_dir, part_threads, headers) = state.read(|app| {
         let task = app
             .tasks
             .iter()
@@ -185,9 +226,10 @@ async fn download_hls(
             .cloned()
             .expect("task exists");
         (
-            task,
+            task.clone(),
             app.settings.save_dir.clone(),
             app.settings.part_threads.max(1),
+            task.headers.clone(),
         )
     });
 
@@ -198,6 +240,7 @@ async fn download_hls(
         }
     });
 
+    wait_if_paused(&state, task_id).await?;
     fs::create_dir_all(&save_dir).await?;
     let client = Client::builder().build()?;
     let header_map = to_header_map(&headers);
@@ -263,6 +306,7 @@ async fn download_hls(
 
         handles.push(tokio::spawn(async move {
             let _permit = permit;
+            wait_if_paused(&state, task_id).await?;
             let bytes = client
                 .get(&segment.url)
                 .headers(header_map.clone())
@@ -297,6 +341,7 @@ async fn download_hls(
         }
     });
 
+    wait_if_paused(&state, task_id).await?;
     let mut output_file = File::create(&output).await?;
     for index in 0..total_segments {
         let part_path = task_dir.join(format!("{index:06}.part"));
@@ -308,14 +353,11 @@ async fn download_hls(
     output_file.flush().await?;
     fs::remove_dir_all(task_dir).await.ok();
 
-    state.write(|app| {
-        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
-            task.status = DownloadStatus::Completed;
-            task.progress = 1.0;
-            task.message = format!("HLS 合并完成: {}", output.display());
-        }
-    });
-
+    mark_completed(
+        &state,
+        task_id,
+        format!("HLS 合并完成: {}", output.display()),
+    );
     Ok(())
 }
 
@@ -385,6 +427,7 @@ async fn download_single(
     let mut downloaded = 0_u64;
 
     while let Some(chunk) = response.chunk().await? {
+        wait_if_paused(&state, task_id).await?;
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
         update_progress(&state, task_id, downloaded, total);
@@ -422,6 +465,7 @@ async fn download_ranged(
 
         handles.push(tokio::spawn(async move {
             let _permit = permit;
+            wait_if_paused(&state, task_id).await?;
             let mut part_headers = headers;
             part_headers.insert(
                 RANGE,
@@ -437,6 +481,7 @@ async fn download_ranged(
             file.seek(std::io::SeekFrom::Start(start)).await?;
 
             while let Some(chunk) = response.chunk().await? {
+                wait_if_paused(&state, task_id).await?;
                 file.write_all(&chunk).await?;
                 add_downloaded(&state, task_id, chunk.len() as u64, total);
             }
@@ -516,13 +561,45 @@ fn add_hls_segment(
     });
 }
 
-fn mark_failed(state: &SharedState, task_id: Uuid, message: String) {
+fn mark_completed(state: &SharedState, task_id: Uuid, message: String) {
     state.write(|app| {
         if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
-            task.status = DownloadStatus::Failed;
+            task.status = DownloadStatus::Completed;
+            task.progress = 1.0;
             task.message = message;
         }
     });
+}
+
+fn mark_failed(state: &SharedState, task_id: Uuid, message: String) {
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            if task.status != DownloadStatus::Paused {
+                task.status = DownloadStatus::Failed;
+                task.message = message;
+            }
+        }
+    });
+}
+
+async fn wait_if_paused(state: &SharedState, task_id: Uuid) -> anyhow::Result<()> {
+    loop {
+        let status = state.read(|app| {
+            app.tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .map(|task| task.status)
+        });
+
+        match status {
+            Some(DownloadStatus::Paused) => sleep(Duration::from_millis(250)).await,
+            Some(
+                DownloadStatus::Failed | DownloadStatus::Unsupported | DownloadStatus::Completed,
+            ) => return Err(anyhow!("下载任务已停止")),
+            Some(DownloadStatus::Queued | DownloadStatus::Downloading) => return Ok(()),
+            None => return Err(anyhow!("下载任务不存在")),
+        }
+    }
 }
 
 fn to_header_map(headers: &[HeaderPair]) -> HeaderMap {
