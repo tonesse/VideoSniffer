@@ -2,7 +2,7 @@ use crate::{
     downloader::{enqueue_download, pause_download, resume_download},
     net::set_retry_attempts,
     sniffer::spawn_sniffer_server,
-    state::{DownloadStatus, MediaItem, MediaType, Settings, SharedState},
+    state::{DownloadStatus, MediaCandidate, MediaItem, MediaType, Settings, SharedState},
 };
 use chrono::{DateTime, Local, Utc};
 use eframe::egui;
@@ -29,6 +29,13 @@ struct SettingsDraft {
     part_retry_attempts: usize,
 }
 
+#[derive(Default)]
+struct ManualDownloadDraft {
+    url: String,
+    title: String,
+    error: Option<String>,
+}
+
 impl SettingsDraft {
     fn from_settings(settings: &Settings) -> Self {
         Self {
@@ -46,7 +53,9 @@ pub struct VideoSnifferApp {
     state: SharedState,
     active_view: AppView,
     show_settings: bool,
+    show_new_task: bool,
     settings_draft: SettingsDraft,
+    manual_download: ManualDownloadDraft,
     sniff_columns: [f32; 7],
     task_columns: [f32; 8],
     last_revision: u64,
@@ -66,7 +75,9 @@ impl VideoSnifferApp {
             state,
             active_view: AppView::Sniffing,
             show_settings: false,
+            show_new_task: false,
             settings_draft: SettingsDraft::from_settings(&settings),
+            manual_download: ManualDownloadDraft::default(),
             sniff_columns: DEFAULT_SNIFF_COLUMNS,
             task_columns: DEFAULT_TASK_COLUMNS,
             last_revision: 0,
@@ -98,6 +109,42 @@ impl VideoSnifferApp {
             .state
             .read(|app| SettingsDraft::from_settings(&app.settings));
         self.show_settings = true;
+    }
+
+    fn open_new_task(&mut self) {
+        self.manual_download = ManualDownloadDraft::default();
+        self.show_new_task = true;
+    }
+
+    fn submit_manual_download(&mut self) {
+        let url = self.manual_download.url.trim().to_string();
+        if url.is_empty() {
+            self.manual_download.error = Some("请输入下载地址".to_string());
+            return;
+        }
+
+        let title = self
+            .manual_download
+            .title
+            .trim()
+            .to_string()
+            .is_empty()
+            .then_some(None)
+            .unwrap_or_else(|| Some(self.manual_download.title.trim().to_string()));
+        let candidate = MediaCandidate {
+            url,
+            page_url: None,
+            title,
+            mime_type: None,
+            content_length: None,
+            method: Some("GET".to_string()),
+            request_headers: Vec::new(),
+        };
+        let item = MediaItem::from(candidate);
+        enqueue_download(self.state.clone(), &item);
+
+        self.show_new_task = false;
+        self.set_view(AppView::Downloading);
     }
 
     fn save_settings(&mut self) {
@@ -169,6 +216,7 @@ impl eframe::App for VideoSnifferApp {
         self.draw_menu_and_toolbar(ctx);
         self.draw_left_categories(ctx);
         self.draw_settings_window(ctx);
+        self.draw_new_task_window(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::WHITE))
@@ -218,9 +266,7 @@ impl VideoSnifferApp {
                 ui.separator();
 
                 ui.horizontal(|ui| {
-                    toolbar_button(ui, "新建任务", true, || {
-                        self.set_view(AppView::Sniffing)
-                    });
+                    toolbar_button(ui, "新建任务", true, || self.open_new_task());
 
                     let selected_status = self.selected_task_status();
                     toolbar_button(
@@ -417,6 +463,57 @@ impl VideoSnifferApp {
         self.show_settings = open && !should_close;
         if should_save {
             self.save_settings();
+        }
+    }
+
+    fn draw_new_task_window(&mut self, ctx: &egui::Context) {
+        if !self.show_new_task {
+            return;
+        }
+
+        let mut open = self.show_new_task;
+        let mut should_submit = false;
+        let mut should_close = false;
+
+        egui::Window::new("新建任务")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label("下载地址");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.manual_download.url)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("https://example.com/video.mp4 或 .m3u8"),
+                );
+
+                ui.add_space(8.0);
+                ui.label("文件名（可选）");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.manual_download.title)
+                        .desired_width(f32::INFINITY),
+                );
+
+                if let Some(error) = &self.manual_download.error {
+                    ui.add_space(8.0);
+                    ui.colored_label(egui::Color32::from_rgb(220, 38, 38), error);
+                }
+
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui.button("开始下载").clicked() {
+                        should_submit = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        should_close = true;
+                    }
+                });
+            });
+
+        self.show_new_task = open && !should_close;
+        if should_submit {
+            self.submit_manual_download();
         }
     }
 }
