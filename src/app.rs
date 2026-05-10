@@ -564,7 +564,7 @@ fn draw_sniffing_table(
                 );
                 table_cell(ui, columns[3], "已嗅探");
                 table_cell(ui, columns[4], local_time(item.detected_at));
-                table_cell(ui, columns[5], &item.url);
+                copyable_table_cell(ui, columns[5], &item.url);
                 cell_ui(ui, columns[6], |ui| {
                     let supported = matches!(
                         item.media_type,
@@ -1092,6 +1092,17 @@ fn table_cell(ui: &mut egui::Ui, width: f32, text: impl AsRef<str>) -> egui::Res
     } else {
         response
     }
+}
+
+fn copyable_table_cell(ui: &mut egui::Ui, width: f32, text: &str) -> egui::Response {
+    let response = table_cell(ui, width, text);
+    response.context_menu(|ui| {
+        if ui.button("复制地址").clicked() {
+            ui.ctx().copy_text(text.to_string());
+            ui.close();
+        }
+    });
+    response
 }
 
 fn selectable_table_cell(
