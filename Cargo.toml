@@ -1,0 +1,18 @@
+[package]
+name = "video_sniffer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+eframe = "0.33"
+egui = "0.33"
+parking_lot = "0.12"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+sanitize-filename = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "io-util"] }
+uuid = { version = "1.18", features = ["v4", "serde"] }
