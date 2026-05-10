@@ -113,7 +113,7 @@ fn draw_detected(state: &SharedState, ui: &mut egui::Ui) {
                 ui.horizontal(|ui| {
                     let supported = matches!(
                         item.media_type,
-                        MediaType::Mp4 | MediaType::Webm | MediaType::Unknown
+                        MediaType::Hls | MediaType::Mp4 | MediaType::Webm | MediaType::Unknown
                     );
                     if ui
                         .add_enabled(supported, egui::Button::new("下载"))
@@ -122,7 +122,7 @@ fn draw_detected(state: &SharedState, ui: &mut egui::Ui) {
                         enqueue_download(state.clone(), &item);
                     }
                     if !supported {
-                        ui.label("HLS/DASH 解析将在下一步加入");
+                        ui.label("DASH 解析将在下一步加入");
                     }
                 });
             });

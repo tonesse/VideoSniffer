@@ -4,9 +4,7 @@ const MEDIA_PATTERNS = [
   ".m3u8",
   ".mpd",
   ".mp4",
-  ".webm",
-  ".m4s",
-  ".ts"
+  ".webm"
 ];
 
 function looksLikeMedia(details) {

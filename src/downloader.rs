@@ -10,7 +10,7 @@ use sanitize_filename::sanitize;
 use std::{path::PathBuf, str::FromStr, sync::Arc};
 use tokio::{
     fs::{self, File},
-    io::{AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::Semaphore,
 };
 use uuid::Uuid;
@@ -72,6 +72,10 @@ async fn run_task(
         )
     });
 
+    if task.media_type == MediaType::Hls {
+        return download_hls(state, task_id, headers).await;
+    }
+
     if !matches!(
         task.media_type,
         MediaType::Mp4 | MediaType::Webm | MediaType::Unknown
@@ -79,8 +83,7 @@ async fn run_task(
         state.write(|app| {
             if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
                 task.status = DownloadStatus::Unsupported;
-                task.message =
-                    "第一版先支持直链 MP4/WEBM；HLS/DASH 会在下一步加入解析与合并".to_string();
+                task.message = "DASH 下载将在下一步加入解析与音视频合并".to_string();
             }
         });
         return Ok(());
@@ -151,6 +154,134 @@ async fn run_task(
             task.status = DownloadStatus::Completed;
             task.progress = 1.0;
             task.message = "下载完成".to_string();
+        }
+    });
+
+    Ok(())
+}
+
+async fn download_hls(
+    state: SharedState,
+    task_id: Uuid,
+    headers: Vec<HeaderPair>,
+) -> anyhow::Result<()> {
+    let (task, save_dir, part_threads) = state.read(|app| {
+        let task = app
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .cloned()
+            .expect("task exists");
+        (
+            task,
+            app.settings.save_dir.clone(),
+            app.settings.part_threads.max(1),
+        )
+    });
+
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.status = DownloadStatus::Downloading;
+            task.message = "正在解析 HLS 播放列表".to_string();
+        }
+    });
+
+    fs::create_dir_all(&save_dir).await?;
+    let client = Client::builder().build()?;
+    let header_map = to_header_map(&headers);
+    let playlist_text = client
+        .get(&task.url)
+        .headers(header_map.clone())
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+
+    let playlist = parse_hls_playlist(&task.url, &playlist_text)?;
+    if playlist.encrypted {
+        return Err(anyhow!("当前版本检测到加密 HLS，暂未处理 EXT-X-KEY 解密"));
+    }
+    if playlist.is_master {
+        return Err(anyhow!(
+            "当前版本检测到多码率 master playlist，下一步会加入清晰度选择"
+        ));
+    }
+    if playlist.segments.is_empty() {
+        return Err(anyhow!("HLS 播放列表中没有可下载分片"));
+    }
+
+    let task_dir = save_dir.join(".parts").join(task_id.to_string());
+    fs::create_dir_all(&task_dir).await?;
+    let output = save_dir.join(output_filename(&task));
+    let total_segments = playlist.segments.len();
+
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.total_bytes = Some(total_segments as u64);
+            task.message = format!("开始下载 {total_segments} 个 HLS 分片，线程数 {part_threads}");
+        }
+    });
+
+    let semaphore = Arc::new(Semaphore::new(part_threads));
+    let mut handles = Vec::with_capacity(total_segments);
+
+    for (index, segment_url) in playlist.segments.iter().cloned().enumerate() {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let state = state.clone();
+        let client = client.clone();
+        let header_map = header_map.clone();
+        let task_dir = task_dir.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            let bytes = client
+                .get(segment_url)
+                .headers(header_map)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            let part_path = task_dir.join(format!("{index:06}.part"));
+            fs::write(part_path, &bytes).await?;
+            add_hls_segment(
+                &state,
+                task_id,
+                index + 1,
+                total_segments,
+                bytes.len() as u64,
+            );
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+
+    for handle in handles {
+        handle.await??;
+    }
+
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.message = "正在合并 HLS 分片".to_string();
+        }
+    });
+
+    let mut output_file = File::create(&output).await?;
+    for index in 0..total_segments {
+        let part_path = task_dir.join(format!("{index:06}.part"));
+        let mut part_file = File::open(&part_path).await?;
+        let mut buffer = Vec::new();
+        part_file.read_to_end(&mut buffer).await?;
+        output_file.write_all(&buffer).await?;
+    }
+    output_file.flush().await?;
+    fs::remove_dir_all(task_dir).await.ok();
+
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.status = DownloadStatus::Completed;
+            task.progress = 1.0;
+            task.message = format!("HLS 合并完成: {}", output.display());
         }
     });
 
@@ -280,6 +411,26 @@ fn add_downloaded(state: &SharedState, task_id: Uuid, bytes: u64, total: u64) {
     });
 }
 
+fn add_hls_segment(
+    state: &SharedState,
+    task_id: Uuid,
+    segment_number: usize,
+    total_segments: usize,
+    bytes: u64,
+) {
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.downloaded_bytes = task.downloaded_bytes.saturating_add(bytes);
+            task.total_bytes = Some(total_segments as u64);
+            task.progress = (segment_number as f32 / total_segments.max(1) as f32).clamp(0.0, 1.0);
+            task.message = format!(
+                "已下载分片 {segment_number}/{total_segments}，累计 {}",
+                format_bytes(task.downloaded_bytes)
+            );
+        }
+    });
+}
+
 fn mark_failed(state: &SharedState, task_id: Uuid, message: String) {
     state.write(|app| {
         if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
@@ -308,6 +459,7 @@ fn output_filename(task: &DownloadTask) -> String {
         filename = sanitize(filename_from_url(&task.url));
     }
     let extension = match task.media_type {
+        MediaType::Hls => "ts",
         MediaType::Webm => "webm",
         _ => "mp4",
     };
@@ -317,6 +469,46 @@ fn output_filename(task: &DownloadTask) -> String {
     } else {
         format!("{filename}.{extension}")
     }
+}
+
+struct HlsPlaylist {
+    segments: Vec<String>,
+    encrypted: bool,
+    is_master: bool,
+}
+
+fn parse_hls_playlist(base_url: &str, text: &str) -> anyhow::Result<HlsPlaylist> {
+    let base = reqwest::Url::parse(base_url)?;
+    let mut segments = Vec::new();
+    let mut encrypted = false;
+    let mut is_master = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("#EXT-X-KEY") {
+            encrypted = true;
+            continue;
+        }
+        if line.starts_with("#EXT-X-STREAM-INF") {
+            is_master = true;
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+
+        let url = base.join(line)?;
+        segments.push(url.to_string());
+    }
+
+    Ok(HlsPlaylist {
+        segments,
+        encrypted,
+        is_master,
+    })
 }
 
 fn format_bytes(bytes: u64) -> String {
