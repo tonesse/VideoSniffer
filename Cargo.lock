@@ -3917,6 +3917,7 @@ dependencies = [
  "reqwest",
  "sanitize-filename",
  "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]

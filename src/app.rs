@@ -1,7 +1,7 @@
 use crate::{
-    downloader::enqueue_download,
+    downloader::{enqueue_download, pause_download, resume_download},
     sniffer::spawn_sniffer_server,
-    state::{DownloadStatus, MediaType, SharedState},
+    state::{DownloadStatus, MediaItem, MediaType, SharedState},
 };
 use eframe::egui;
 
@@ -72,7 +72,7 @@ impl eframe::App for VideoSnifferApp {
                 }
 
                 ui.add_space(8.0);
-                ui.label("浏览器扩展把媒体请求 POST 到本地接口后，会自动出现在右侧列表。");
+                ui.label("嗅探记录、任务和设置会自动保存到本地。应用重启后可恢复任务。");
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -134,11 +134,7 @@ fn draw_detected(state: &SharedState, ui: &mut egui::Ui) {
     });
 }
 
-fn draw_hls_quality_selector(
-    state: &SharedState,
-    ui: &mut egui::Ui,
-    item: &crate::state::MediaItem,
-) {
+fn draw_hls_quality_selector(state: &SharedState, ui: &mut egui::Ui, item: &MediaItem) {
     if item.hls_variants.is_empty() {
         if let Some(status) = &item.hls_status {
             ui.small(status);
@@ -216,6 +212,23 @@ fn draw_tasks(state: &SharedState, ui: &mut egui::Ui) {
                     ui.small(format!("总大小: {}", human_bytes(total)));
                 }
                 ui.small(format!("媒体 ID: {}", task.media_id));
+
+                ui.horizontal(|ui| {
+                    if matches!(
+                        task.status,
+                        DownloadStatus::Queued | DownloadStatus::Downloading
+                    ) && ui.button("暂停").clicked()
+                    {
+                        pause_download(state.clone(), task.id);
+                    }
+                    if matches!(
+                        task.status,
+                        DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Queued
+                    ) && ui.button("恢复").clicked()
+                    {
+                        resume_download(state.clone(), task.id);
+                    }
+                });
             });
             ui.add_space(8.0);
         }
@@ -226,6 +239,7 @@ fn status_label(ui: &mut egui::Ui, status: DownloadStatus) {
     let color = match status {
         DownloadStatus::Queued => egui::Color32::GRAY,
         DownloadStatus::Downloading => egui::Color32::from_rgb(37, 99, 235),
+        DownloadStatus::Paused => egui::Color32::from_rgb(217, 119, 6),
         DownloadStatus::Completed => egui::Color32::from_rgb(22, 163, 74),
         DownloadStatus::Failed => egui::Color32::from_rgb(220, 38, 38),
         DownloadStatus::Unsupported => egui::Color32::from_rgb(217, 119, 6),
