@@ -109,6 +109,9 @@ fn draw_detected(state: &SharedState, ui: &mut egui::Ui) {
                 if let Some(page_url) = &item.page_url {
                     ui.small(format!("来源页: {page_url}"));
                 }
+                if item.media_type == MediaType::Hls {
+                    draw_hls_quality_selector(state, ui, &item);
+                }
 
                 ui.horizontal(|ui| {
                     let supported = matches!(
@@ -129,6 +132,62 @@ fn draw_detected(state: &SharedState, ui: &mut egui::Ui) {
             ui.add_space(8.0);
         }
     });
+}
+
+fn draw_hls_quality_selector(
+    state: &SharedState,
+    ui: &mut egui::Ui,
+    item: &crate::state::MediaItem,
+) {
+    if item.hls_variants.is_empty() {
+        if let Some(status) = &item.hls_status {
+            ui.small(status);
+        } else {
+            ui.small("正在等待 HLS 清晰度分析");
+        }
+        return;
+    }
+
+    let selected_url = item
+        .selected_hls_variant_url
+        .clone()
+        .or_else(|| item.hls_variants.first().map(|variant| variant.url.clone()));
+    let selected_label = selected_url
+        .as_ref()
+        .and_then(|url| {
+            item.hls_variants
+                .iter()
+                .find(|variant| &variant.url == url)
+                .map(|variant| variant.label())
+        })
+        .unwrap_or_else(|| "自动最高码率".to_string());
+
+    ui.horizontal(|ui| {
+        ui.label("清晰度");
+        egui::ComboBox::from_id_salt(format!("hls-quality-{}", item.id))
+            .selected_text(selected_label)
+            .show_ui(ui, |ui| {
+                for variant in &item.hls_variants {
+                    let label = variant.label();
+                    let selected = selected_url.as_deref() == Some(variant.url.as_str());
+                    if ui.selectable_label(selected, label).clicked() {
+                        let url = variant.url.clone();
+                        state.write(|app| {
+                            if let Some(media) =
+                                app.detected.iter_mut().find(|media| media.id == item.id)
+                            {
+                                media.selected_hls_variant_url = Some(url);
+                                media.hls_status = Some("已切换清晰度".to_string());
+                            }
+                        });
+                    }
+                }
+            });
+    });
+
+    if let Some(status) = &item.hls_status {
+        ui.small(status);
+    }
 }
 
 fn draw_tasks(state: &SharedState, ui: &mut egui::Ui) {

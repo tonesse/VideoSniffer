@@ -1,5 +1,9 @@
-use crate::state::{
-    DownloadStatus, DownloadTask, HeaderPair, MediaItem, MediaType, SharedState, filename_from_url,
+use crate::{
+    hls::{choose_highest_variant, parse_hls_playlist, sort_variants_highest_first},
+    state::{
+        DownloadStatus, DownloadTask, HeaderPair, MediaItem, MediaType, SharedState,
+        filename_from_url,
+    },
 };
 use anyhow::{Context, anyhow};
 use reqwest::{
@@ -20,7 +24,7 @@ pub fn enqueue_download(state: SharedState, media: &MediaItem) {
         id: Uuid::new_v4(),
         media_id: media.id,
         title: media.title.clone(),
-        url: media.url.clone(),
+        url: media.selected_hls_url(),
         media_type: media.media_type,
         status: DownloadStatus::Queued,
         progress: 0.0,
@@ -190,8 +194,9 @@ async fn download_hls(
     fs::create_dir_all(&save_dir).await?;
     let client = Client::builder().build()?;
     let header_map = to_header_map(&headers);
-    let playlist_text = client
-        .get(&task.url)
+    let mut playlist_url = task.url.clone();
+    let mut playlist_text = client
+        .get(&playlist_url)
         .headers(header_map.clone())
         .send()
         .await?
@@ -199,14 +204,29 @@ async fn download_hls(
         .text()
         .await?;
 
-    let playlist = parse_hls_playlist(&task.url, &playlist_text)?;
+    let mut playlist = parse_hls_playlist(&playlist_url, &playlist_text)?;
+    if playlist.is_master() {
+        let mut variants = playlist.variants.clone();
+        sort_variants_highest_first(&mut variants);
+        let selected_variant = choose_highest_variant(&variants)?;
+        playlist_url = selected_variant.url.clone();
+        state.write(|app| {
+            if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+                task.message = format!("自动选择清晰度 {}", selected_variant.label());
+            }
+        });
+        playlist_text = client
+            .get(&playlist_url)
+            .headers(header_map.clone())
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        playlist = parse_hls_playlist(&playlist_url, &playlist_text)?;
+    }
     if playlist.encrypted {
         return Err(anyhow!("当前版本检测到加密 HLS，暂未处理 EXT-X-KEY 解密"));
-    }
-    if playlist.is_master {
-        return Err(anyhow!(
-            "当前版本检测到多码率 master playlist，下一步会加入清晰度选择"
-        ));
     }
     if playlist.segments.is_empty() {
         return Err(anyhow!("HLS 播放列表中没有可下载分片"));
@@ -473,46 +493,6 @@ fn output_filename(task: &DownloadTask) -> String {
     } else {
         format!("{filename}.{extension}")
     }
-}
-
-struct HlsPlaylist {
-    segments: Vec<String>,
-    encrypted: bool,
-    is_master: bool,
-}
-
-fn parse_hls_playlist(base_url: &str, text: &str) -> anyhow::Result<HlsPlaylist> {
-    let base = reqwest::Url::parse(base_url)?;
-    let mut segments = Vec::new();
-    let mut encrypted = false;
-    let mut is_master = false;
-
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with("#EXT-X-KEY") {
-            encrypted = true;
-            continue;
-        }
-        if line.starts_with("#EXT-X-STREAM-INF") {
-            is_master = true;
-            continue;
-        }
-        if line.starts_with('#') {
-            continue;
-        }
-
-        let url = base.join(line)?;
-        segments.push(url.to_string());
-    }
-
-    Ok(HlsPlaylist {
-        segments,
-        encrypted,
-        is_master,
-    })
 }
 
 fn format_bytes(bytes: u64) -> String {
