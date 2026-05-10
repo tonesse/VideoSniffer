@@ -2,12 +2,16 @@ use crate::{
     downloader::{enqueue_download, pause_download, resume_download},
     net::set_retry_attempts,
     sniffer::spawn_sniffer_server,
-    state::{DownloadStatus, MediaCandidate, MediaItem, MediaType, Settings, SharedState},
+    state::{
+        DownloadStatus, DownloadTask, MediaCandidate, MediaItem, MediaType, Settings, SharedState,
+        filename_from_url,
+    },
 };
 use chrono::{DateTime, Local, Utc};
 use eframe::egui;
+use sanitize_filename::sanitize;
 use serde_json::Value;
-use std::{collections::HashSet, fs, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, fs, path::PathBuf, process::Command, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -691,8 +695,12 @@ fn draw_task_table(
         for task in tasks {
             table_row(ui, columns, |ui| {
                 let selected = *selected_task_id == Some(task.id);
-                if selectable_table_cell(ui, columns[0], &task.title, selected).clicked() {
+                let title_response = selectable_table_cell(ui, columns[0], &task.title, selected);
+                if title_response.clicked() {
                     *selected_task_id = Some(task.id);
+                }
+                if completed_only && title_response.double_clicked() {
+                    open_completed_task(state, selected_task_id, task.id);
                 }
                 table_cell(
                     ui,
@@ -827,6 +835,56 @@ fn draw_task_detail(state: &SharedState, ui: &mut egui::Ui, selected_task_id: Op
                 }
             }
         });
+}
+
+fn open_completed_task(state: &SharedState, selected_task_id: &mut Option<Uuid>, task_id: Uuid) {
+    let detail = state.read(|app| {
+        let task = app.tasks.iter().find(|task| task.id == task_id).cloned();
+        (task, app.settings.save_dir.clone())
+    });
+
+    let Some(task) = detail.0 else {
+        return;
+    };
+
+    let Some(path) = completed_output_path(&detail.1, &task) else {
+        state.write(|app| app.tasks.retain(|task| task.id != task_id));
+        if *selected_task_id == Some(task_id) {
+            *selected_task_id = None;
+        }
+        return;
+    };
+
+    let _ = Command::new("explorer").arg(path).spawn();
+}
+
+fn completed_output_path(save_dir: &PathBuf, task: &DownloadTask) -> Option<PathBuf> {
+    let output = save_dir.join(output_filename(task));
+    if task.media_type == MediaType::Hls {
+        let mp4 = output.with_extension("mp4");
+        if mp4.exists() {
+            return Some(mp4);
+        }
+    }
+    output.exists().then_some(output)
+}
+
+fn output_filename(task: &DownloadTask) -> String {
+    let mut filename = sanitize(&task.title);
+    if filename.trim().is_empty() {
+        filename = sanitize(filename_from_url(&task.url));
+    }
+    let extension = match task.media_type {
+        MediaType::Hls => "ts",
+        MediaType::Webm => "webm",
+        _ => "mp4",
+    };
+
+    if filename.to_ascii_lowercase().ends_with(extension) {
+        filename
+    } else {
+        format!("{filename}.{extension}")
+    }
 }
 
 struct ManifestSummary {
