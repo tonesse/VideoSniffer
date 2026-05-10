@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
     sync::Arc,
 };
@@ -402,13 +403,10 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
         output_file.write_all(&buffer).await?;
     }
     output_file.flush().await?;
+    let remux = remux_hls_output_if_possible(&output).await?;
     fs::remove_dir_all(task_dir).await.ok();
 
-    mark_completed(
-        &state,
-        task_id,
-        format!("HLS 合并完成: {}", output.display()),
-    );
+    mark_completed(&state, task_id, format!("HLS 合并完成: {}", remux.message));
     Ok(())
 }
 
@@ -776,6 +774,62 @@ fn mark_completed(state: &SharedState, task_id: Uuid, message: String) {
             task.message = message;
         }
     });
+}
+
+struct RemuxResult {
+    message: String,
+}
+
+async fn remux_hls_output_if_possible(ts_path: &Path) -> anyhow::Result<RemuxResult> {
+    let mp4_path = ts_path.with_extension("mp4");
+    let ts_path = ts_path.to_path_buf();
+    let ts_path_for_task = ts_path.clone();
+    let mp4_path_for_task = mp4_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                &ts_path_for_task.to_string_lossy(),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                &mp4_path_for_task.to_string_lossy(),
+            ])
+            .output()
+    })
+    .await
+    .context("等待 ffmpeg remux 任务失败")?;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            fs::remove_file(ts_path).await.ok();
+            Ok(RemuxResult {
+                message: format!("已 remux 为 MP4: {}", mp4_path.display()),
+            })
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(RemuxResult {
+                message: format!(
+                    "已保留 TS: {}；ffmpeg remux 失败: {}",
+                    ts_path.display(),
+                    stderr.trim()
+                ),
+            })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(RemuxResult {
+            message: format!("已保留 TS: {}；未检测到 ffmpeg", ts_path.display()),
+        }),
+        Err(err) => Ok(RemuxResult {
+            message: format!("已保留 TS: {}；启动 ffmpeg 失败: {err}", ts_path.display()),
+        }),
+    }
 }
 
 fn mark_failed(state: &SharedState, task_id: Uuid, message: String) {
