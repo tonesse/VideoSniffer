@@ -1,9 +1,9 @@
-use crate::state::{HeaderPair, HlsVariant, MediaType, SharedState};
-use anyhow::anyhow;
-use reqwest::{
-    Client,
-    header::{HeaderMap, HeaderName, HeaderValue},
+use crate::{
+    net::{build_client, text_with_retry},
+    state::{HeaderPair, HlsVariant, MediaType, SharedState},
 };
+use anyhow::anyhow;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -40,15 +40,12 @@ async fn analyze_hls_variants(state: SharedState, media_id: Uuid) -> anyhow::Res
 
     update_hls_status(&state, media_id, "正在分析 HLS 清晰度".to_string());
 
-    let client = Client::builder().build()?;
-    let text = client
-        .get(&url)
-        .headers(to_header_map(&headers))
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let client = build_client()?;
+    let text = text_with_retry(
+        client.get(&url).headers(to_header_map(&headers)),
+        "分析 HLS 清晰度",
+    )
+    .await?;
     let playlist = parse_hls_playlist(&url, &text)?;
 
     if playlist.variants.is_empty() {
