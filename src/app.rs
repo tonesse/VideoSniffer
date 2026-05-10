@@ -135,6 +135,27 @@ impl VideoSnifferApp {
             .write(|app| app.tasks.retain(|task| task.id != selected));
         self.selected_task_id = None;
     }
+
+    fn delete_current_page_items(&mut self) {
+        match self.active_view {
+            AppView::Sniffing => {
+                self.state.write(|app| app.detected.clear());
+            }
+            AppView::Downloading => {
+                self.state.write(|app| {
+                    app.tasks
+                        .retain(|task| task.status == DownloadStatus::Completed)
+                });
+            }
+            AppView::Completed => {
+                self.state.write(|app| {
+                    app.tasks
+                        .retain(|task| task.status != DownloadStatus::Completed)
+                });
+            }
+        }
+        self.selected_task_id = None;
+    }
 }
 
 impl eframe::App for VideoSnifferApp {
@@ -236,11 +257,7 @@ impl VideoSnifferApp {
                         self.delete_selected_record();
                     });
                     toolbar_button(ui, "删除全部", true, || {
-                        self.state.write(|app| {
-                            app.tasks
-                                .retain(|task| task.status != DownloadStatus::Completed);
-                        });
-                        self.selected_task_id = None;
+                        self.delete_current_page_items()
                     });
 
                     ui.separator();
