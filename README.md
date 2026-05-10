@@ -13,7 +13,7 @@ Rust Windows desktop app prototype for browser video sniffing and multi-threaded
 - Failed HLS or range parts are deprioritized and retried later so other parts can continue first.
 - Incomplete HLS and range downloads keep a temporary manifest at `.parts/{task_id}/manifest.json` so restart/resume skips completed parts.
 - Downloader supports direct MP4/WEBM/unknown file URLs with ranged multi-thread download when the server supports `Accept-Ranges: bytes`.
-- HLS media playlists are downloaded by fetching segments concurrently and merging them into a `.ts` output file.
+- HLS media playlists are downloaded by fetching segments concurrently, merging into `.ts`, and remuxing to `.mp4` with `ffmpeg` when available.
 - HLS master playlists are analyzed automatically. The app defaults to the highest bitrate variant and lets the user switch quality in the UI before downloading.
 - Non-DRM HLS `EXT-X-KEY:METHOD=AES-128` streams are decrypted when the playlist exposes the key URL and IV.
 - DASH parsing is intentionally separated for the next step.
@@ -49,8 +49,8 @@ cargo run
 - Non-encrypted HLS media playlist segment download and merge.
 - HLS master playlist quality discovery, highest-bitrate default selection, and manual quality switching.
 - AES-128 HLS segment decryption using playlist-provided `EXT-X-KEY` metadata.
+- Optional HLS TS-to-MP4 remuxing through `ffmpeg -c copy`, with TS fallback when ffmpeg is unavailable.
 
 ## Next Implementation Step
 
-- Improve HLS output container handling and optional remuxing.
 - Add per-part retry history and last error visibility.
