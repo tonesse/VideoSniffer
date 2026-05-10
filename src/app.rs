@@ -248,23 +248,10 @@ impl eframe::App for VideoSnifferApp {
 impl VideoSnifferApp {
     fn draw_menu_and_toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("menu_toolbar")
-            .exact_height(92.0)
+            .exact_height(58.0)
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(238, 238, 238)))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(6.0);
-                    if ui.button("任务").clicked() {
-                        self.set_view(AppView::Downloading);
-                    }
-                    if ui.button("文件").clicked() {}
-                    if ui.button("下载").clicked() {
-                        self.set_view(AppView::Sniffing);
-                    }
-                    if ui.button("查看").clicked() {}
-                    if ui.button("关于").clicked() {}
-                });
-                ui.separator();
-
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     toolbar_button(ui, "新建任务", true, || self.open_new_task());
 
