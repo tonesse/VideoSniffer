@@ -4,11 +4,15 @@ use crate::{
     state::{DownloadStatus, MediaItem, MediaType, SharedState},
 };
 use eframe::egui;
+use serde_json::Value;
+use std::{collections::HashSet, fs, path::PathBuf};
+use uuid::Uuid;
 
 pub struct VideoSnifferApp {
     state: SharedState,
     save_dir_input: String,
     last_revision: u64,
+    selected_task_id: Option<Uuid>,
 }
 
 impl VideoSnifferApp {
@@ -26,6 +30,7 @@ impl VideoSnifferApp {
             state,
             save_dir_input,
             last_revision: 0,
+            selected_task_id: None,
         }
     }
 }
@@ -78,7 +83,9 @@ impl eframe::App for VideoSnifferApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.columns(2, |columns| {
                 draw_detected(&self.state, &mut columns[0]);
-                draw_tasks(&self.state, &mut columns[1]);
+                draw_tasks(&self.state, &mut columns[1], &mut self.selected_task_id);
+                columns[1].separator();
+                draw_task_detail(&self.state, &mut columns[1], self.selected_task_id);
             });
         });
     }
@@ -186,7 +193,7 @@ fn draw_hls_quality_selector(state: &SharedState, ui: &mut egui::Ui, item: &Medi
     }
 }
 
-fn draw_tasks(state: &SharedState, ui: &mut egui::Ui) {
+fn draw_tasks(state: &SharedState, ui: &mut egui::Ui, selected_task_id: &mut Option<Uuid>) {
     ui.heading("下载队列");
     ui.add_space(6.0);
 
@@ -228,11 +235,223 @@ fn draw_tasks(state: &SharedState, ui: &mut egui::Ui) {
                     {
                         resume_download(state.clone(), task.id);
                     }
+                    if ui.button("详情").clicked() {
+                        *selected_task_id = Some(task.id);
+                    }
                 });
             });
             ui.add_space(8.0);
         }
     });
+}
+
+fn draw_task_detail(state: &SharedState, ui: &mut egui::Ui, selected_task_id: Option<Uuid>) {
+    ui.heading("任务详情");
+    ui.add_space(6.0);
+
+    let Some(task_id) = selected_task_id else {
+        ui.group(|ui| {
+            ui.label("选择一个下载任务查看分片状态。");
+        });
+        return;
+    };
+
+    let detail = state.read(|app| {
+        let task = app.tasks.iter().find(|task| task.id == task_id).cloned();
+        let save_dir = app.settings.save_dir.clone();
+        (task, save_dir)
+    });
+
+    let Some(task) = detail.0 else {
+        ui.group(|ui| {
+            ui.label("任务不存在。");
+        });
+        return;
+    };
+
+    let manifest_path = detail
+        .1
+        .join(".parts")
+        .join(task.id.to_string())
+        .join("manifest.json");
+    let manifest = read_manifest_summary(&manifest_path);
+
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.strong(&task.title);
+            status_label(ui, task.status);
+        });
+        ui.small(&task.url);
+        ui.label(format!("任务 ID: {}", task.id));
+        ui.label(format!("媒体类型: {}", task.media_type.label()));
+        ui.label(format!("进度: {:.1}%", task.progress * 100.0));
+        ui.label(format!("已下载: {}", human_bytes(task.downloaded_bytes)));
+        ui.label(format!("临时记录: {}", manifest_path.display()));
+
+        match manifest {
+            Some(summary) => {
+                ui.separator();
+                ui.label(format!("分片类型: {}", summary.kind));
+                if let Some(total) = summary.total_parts {
+                    ui.label(format!("总分片: {total}"));
+                }
+                ui.label(format!("已完成分片: {}", summary.completed_parts));
+                ui.label(format!(
+                    "待下载分片: {}",
+                    summary.pending_parts.unwrap_or(0)
+                ));
+                if summary.downloaded_bytes > 0 {
+                    ui.label(format!(
+                        "manifest 已记录: {}",
+                        human_bytes(summary.downloaded_bytes)
+                    ));
+                }
+
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for line in summary.preview_lines {
+                            ui.small(line);
+                        }
+                    });
+            }
+            None => {
+                ui.separator();
+                if task.status == DownloadStatus::Completed {
+                    ui.label("任务已完成，临时分片记录已清理。");
+                } else {
+                    ui.label("还没有临时分片记录，任务开始分片下载后会生成。");
+                }
+            }
+        }
+    });
+}
+
+struct ManifestSummary {
+    kind: String,
+    total_parts: Option<usize>,
+    completed_parts: usize,
+    pending_parts: Option<usize>,
+    downloaded_bytes: u64,
+    preview_lines: Vec<String>,
+}
+
+fn read_manifest_summary(path: &PathBuf) -> Option<ManifestSummary> {
+    let json = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&json).ok()?;
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown")
+        .to_string();
+    let total_parts = value
+        .get("total_parts")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0);
+
+    if kind == "Hls" {
+        let parts = value
+            .get("hls_parts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let completed = parts
+            .iter()
+            .filter(|part| {
+                part.get("completed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .count();
+        let downloaded_bytes = parts
+            .iter()
+            .filter(|part| {
+                part.get("completed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .filter_map(|part| part.get("bytes").and_then(Value::as_u64))
+            .sum();
+        let preview_lines = parts
+            .iter()
+            .take(80)
+            .map(|part| {
+                let index = part.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let bytes = part.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                let done = part
+                    .get("completed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                format!(
+                    "#{index}: {} · {}",
+                    if done { "完成" } else { "待下载" },
+                    human_bytes(bytes)
+                )
+            })
+            .collect::<Vec<_>>();
+
+        return Some(ManifestSummary {
+            kind,
+            total_parts,
+            completed_parts: completed,
+            pending_parts: total_parts.map(|total| total.saturating_sub(completed)),
+            downloaded_bytes,
+            preview_lines,
+        });
+    }
+
+    let parts = value
+        .get("range_parts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let completed_ranges = parts
+        .iter()
+        .filter(|part| {
+            part.get("completed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let downloaded_bytes = completed_ranges
+        .iter()
+        .map(|part| {
+            let start = part.get("start").and_then(Value::as_u64).unwrap_or(0);
+            let end = part.get("end").and_then(Value::as_u64).unwrap_or(0);
+            end.saturating_sub(start).saturating_add(1)
+        })
+        .sum();
+    let preview_lines = completed_ranges
+        .iter()
+        .take(80)
+        .map(|part| {
+            let start = part.get("start").and_then(Value::as_u64).unwrap_or(0);
+            let end = part.get("end").and_then(Value::as_u64).unwrap_or(0);
+            format!(
+                "{start}-{end}: 完成 · {}",
+                human_bytes(end.saturating_sub(start).saturating_add(1))
+            )
+        })
+        .collect::<Vec<_>>();
+    let unique_ranges = completed_ranges
+        .iter()
+        .map(|part| {
+            (
+                part.get("start").and_then(Value::as_u64).unwrap_or(0),
+                part.get("end").and_then(Value::as_u64).unwrap_or(0),
+            )
+        })
+        .collect::<HashSet<_>>();
+
+    Some(ManifestSummary {
+        kind,
+        total_parts,
+        completed_parts: unique_ranges.len(),
+        pending_parts: None,
+        downloaded_bytes,
+        preview_lines,
+    })
 }
 
 fn status_label(ui: &mut egui::Ui, status: DownloadStatus) {

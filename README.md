@@ -41,6 +41,7 @@ cargo run
 - Download queue.
 - Pause/resume controls for active tasks.
 - Persisted task history and settings.
+- Task detail panel showing temporary manifest progress for completed and pending parts.
 - Retry handling for playlist, key, segment, direct and range requests.
 - Per-part retry queue for HLS segments and ranged direct downloads.
 - Partial-file reuse for completed HLS segments and completed range parts after pause, crash or app restart.
@@ -52,4 +53,4 @@ cargo run
 ## Next Implementation Step
 
 - Improve HLS output container handling and optional remuxing.
-- Add clearer task detail UI for completed, pending and retried parts.
+- Add per-part retry history and last error visibility.
