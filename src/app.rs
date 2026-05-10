@@ -68,14 +68,21 @@ impl VideoSnifferApp {
 
     fn clear_undownloaded_detected(&self) {
         self.state.write(|app| {
-            let downloaded_or_queued = app
+            let queued_media = app
                 .tasks
                 .iter()
                 .map(|task| task.media_id)
                 .collect::<HashSet<_>>();
-            app.detected
-                .retain(|item| downloaded_or_queued.contains(&item.id));
+            app.detected.retain(|item| queued_media.contains(&item.id));
         });
+    }
+
+    fn set_view(&mut self, next: AppView) {
+        if self.active_view == AppView::Sniffing && next != AppView::Sniffing {
+            self.clear_undownloaded_detected();
+        }
+        self.active_view = next;
+        self.selected_task_id = None;
     }
 
     fn open_settings(&mut self) {
@@ -101,6 +108,25 @@ impl VideoSnifferApp {
         });
         self.show_settings = false;
     }
+
+    fn selected_task_status(&self) -> Option<DownloadStatus> {
+        let selected = self.selected_task_id?;
+        self.state.read(|app| {
+            app.tasks
+                .iter()
+                .find(|task| task.id == selected)
+                .map(|task| task.status)
+        })
+    }
+
+    fn delete_selected_record(&mut self) {
+        let Some(selected) = self.selected_task_id else {
+            return;
+        };
+        self.state
+            .write(|app| app.tasks.retain(|task| task.id != selected));
+        self.selected_task_id = None;
+    }
 }
 
 impl eframe::App for VideoSnifferApp {
@@ -111,91 +137,171 @@ impl eframe::App for VideoSnifferApp {
             ctx.request_repaint();
         }
 
-        let previous_view = self.active_view;
-        self.draw_top_bar(ctx);
-        if previous_view == AppView::Sniffing && self.active_view != AppView::Sniffing {
-            self.clear_undownloaded_detected();
-        }
+        self.draw_menu_and_toolbar(ctx);
+        self.draw_left_categories(ctx);
         self.draw_settings_window(ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(egui::Color32::from_rgb(246, 248, 251)))
-            .show(ctx, |ui| {
-                ui.add_space(12.0);
-                match self.active_view {
-                    AppView::Sniffing => draw_sniffing(&self.state, ui, &mut self.active_view),
-                    AppView::Downloading => {
-                        draw_task_list(&self.state, ui, &mut self.selected_task_id, false)
-                    }
-                    AppView::Completed => {
-                        draw_task_list(&self.state, ui, &mut self.selected_task_id, true)
-                    }
+            .frame(egui::Frame::default().fill(egui::Color32::WHITE))
+            .show(ctx, |ui| match self.active_view {
+                AppView::Sniffing => draw_sniffing_table(&self.state, ui, &mut self.active_view),
+                AppView::Downloading => {
+                    draw_task_table(&self.state, ui, &mut self.selected_task_id, false)
+                }
+                AppView::Completed => {
+                    draw_task_table(&self.state, ui, &mut self.selected_task_id, true)
                 }
             });
     }
 }
 
 impl VideoSnifferApp {
-    fn draw_top_bar(&mut self, ctx: &egui::Context) {
-        let (detected, running, completed, settings) = self.state.read(|app| {
-            (
-                app.detected.len(),
-                app.tasks
-                    .iter()
-                    .filter(|task| task.status != DownloadStatus::Completed)
-                    .count(),
-                app.tasks
-                    .iter()
-                    .filter(|task| task.status == DownloadStatus::Completed)
-                    .count(),
-                app.settings.clone(),
-            )
+    fn draw_menu_and_toolbar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("menu_toolbar")
+            .exact_height(92.0)
+            .frame(egui::Frame::default().fill(egui::Color32::from_rgb(238, 238, 238)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
+                    if ui.button("任务").clicked() {
+                        self.set_view(AppView::Downloading);
+                    }
+                    if ui.button("文件").clicked() {}
+                    if ui.button("下载").clicked() {
+                        self.set_view(AppView::Sniffing);
+                    }
+                    if ui.button("查看").clicked() {}
+                    if ui.button("关于").clicked() {}
+                });
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    toolbar_button(ui, "新建任务", true, || {
+                        self.set_view(AppView::Sniffing)
+                    });
+
+                    let selected_status = self.selected_task_status();
+                    toolbar_button(
+                        ui,
+                        "继续",
+                        matches!(
+                            selected_status,
+                            Some(
+                                DownloadStatus::Paused
+                                    | DownloadStatus::Failed
+                                    | DownloadStatus::Queued
+                            )
+                        ),
+                        || {
+                            if let Some(id) = self.selected_task_id {
+                                resume_download(self.state.clone(), id);
+                            }
+                        },
+                    );
+                    toolbar_button(
+                        ui,
+                        "暂停",
+                        matches!(
+                            selected_status,
+                            Some(DownloadStatus::Queued | DownloadStatus::Downloading)
+                        ),
+                        || {
+                            if let Some(id) = self.selected_task_id {
+                                pause_download(self.state.clone(), id);
+                            }
+                        },
+                    );
+                    toolbar_button(ui, "删除任务", self.selected_task_id.is_some(), || {
+                        self.delete_selected_record();
+                    });
+                    toolbar_button(ui, "删除全部", true, || {
+                        self.state.write(|app| {
+                            app.tasks
+                                .retain(|task| task.status != DownloadStatus::Completed);
+                        });
+                        self.selected_task_id = None;
+                    });
+
+                    ui.separator();
+                    toolbar_button(ui, "选项", true, || self.open_settings());
+                    toolbar_button(ui, "嗅探资源", true, || {
+                        self.set_view(AppView::Sniffing)
+                    });
+                    toolbar_button(ui, "下载中", true, || {
+                        self.set_view(AppView::Downloading)
+                    });
+                    toolbar_button(ui, "已下载", true, || self.set_view(AppView::Completed));
+                });
+            });
+    }
+
+    fn draw_left_categories(&mut self, ctx: &egui::Context) {
+        let (detected, running, completed, all) = self.state.read(|app| {
+            let running = app
+                .tasks
+                .iter()
+                .filter(|task| task.status != DownloadStatus::Completed)
+                .count();
+            let completed = app
+                .tasks
+                .iter()
+                .filter(|task| task.status == DownloadStatus::Completed)
+                .count();
+            (app.detected.len(), running, completed, app.tasks.len())
         });
 
-        egui::TopBottomPanel::top("top_bar")
-            .exact_height(74.0)
-            .frame(egui::Frame::default().fill(egui::Color32::WHITE))
+        egui::SidePanel::left("categories")
+            .exact_width(178.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(247, 247, 247))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(210, 210, 210),
+                    )),
+            )
             .show(ctx, |ui| {
-                ui.add_space(10.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    ui.vertical(|ui| {
-                        ui.heading("VideoSniffer");
-                        ui.small(format!(
-                            "监听 127.0.0.1:{} · 保存到 {}",
-                            settings.listen_port,
-                            compact_text(&settings.save_dir.to_string_lossy(), 54)
-                        ));
-                    });
-
+                    ui.label("分类");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("设置").clicked() {
-                            self.open_settings();
-                        }
-                        ui.add_space(8.0);
-                        nav_button(
-                            ui,
-                            &mut self.active_view,
-                            AppView::Completed,
-                            "已下载",
-                            completed,
-                        );
-                        nav_button(
-                            ui,
-                            &mut self.active_view,
-                            AppView::Downloading,
-                            "下载中",
-                            running,
-                        );
-                        nav_button(
-                            ui,
-                            &mut self.active_view,
-                            AppView::Sniffing,
-                            "嗅探资源",
-                            detected,
-                        );
+                        ui.label("x");
                     });
                 });
+                ui.separator();
+                ui.small(format!("全部任务: {all}"));
+                category_row(
+                    ui,
+                    "嗅探资源",
+                    detected,
+                    self.active_view == AppView::Sniffing,
+                    || {
+                        self.set_view(AppView::Sniffing);
+                    },
+                );
+                category_row(
+                    ui,
+                    "正在下载",
+                    running,
+                    self.active_view == AppView::Downloading,
+                    || {
+                        self.set_view(AppView::Downloading);
+                    },
+                );
+                category_row(
+                    ui,
+                    "已下载",
+                    completed,
+                    self.active_view == AppView::Completed,
+                    || {
+                        self.set_view(AppView::Completed);
+                    },
+                );
+                ui.separator();
+                ui.small("文件类型");
+                ui.label("  视频");
+                ui.label("  HLS");
+                ui.label("  MP4 / WEBM");
             });
     }
 
@@ -208,7 +314,7 @@ impl VideoSnifferApp {
         let mut should_save = false;
         let mut should_close = false;
 
-        egui::Window::new("设置")
+        egui::Window::new("选项")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -288,53 +394,53 @@ impl VideoSnifferApp {
     }
 }
 
-fn nav_button(ui: &mut egui::Ui, active: &mut AppView, view: AppView, label: &str, count: usize) {
-    let selected = *active == view;
-    let text = format!("{label} {count}");
-    if ui.selectable_label(selected, text).clicked() {
-        *active = view;
+fn toolbar_button(ui: &mut egui::Ui, text: &str, enabled: bool, action: impl FnOnce()) {
+    let button = egui::Button::new(text).min_size(egui::vec2(68.0, 42.0));
+    if ui.add_enabled(enabled, button).clicked() {
+        action();
     }
 }
 
-fn draw_sniffing(state: &SharedState, ui: &mut egui::Ui, active_view: &mut AppView) {
-    section_header(ui, "嗅探资源", "只显示当前页面捕获到、尚未加入下载的资源");
+fn category_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    count: usize,
+    selected: bool,
+    action: impl FnOnce(),
+) {
+    let text = format!("  {label} ({count})");
+    if ui.selectable_label(selected, text).clicked() {
+        action();
+    }
+}
+
+fn draw_sniffing_table(state: &SharedState, ui: &mut egui::Ui, active_view: &mut AppView) {
+    table_header(
+        ui,
+        &["文件名", "类型", "大小", "状态", "时间", "地址", "操作"],
+    );
 
     let items = state.read(|app| app.detected.iter().cloned().collect::<Vec<_>>());
     if items.is_empty() {
-        empty_state(
+        empty_row(
             ui,
-            "还没有捕获到视频资源",
-            "打开浏览器播放视频后，可下载资源会出现在这里。",
+            "还没有嗅探到视频资源。打开浏览器播放视频后，可下载资源会出现在这里。",
         );
         return;
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        for item in items {
-            resource_card(state, ui, &item, active_view);
-            ui.add_space(8.0);
-        }
-    });
-}
-
-fn resource_card(
-    state: &SharedState,
-    ui: &mut egui::Ui,
-    item: &MediaItem,
-    active_view: &mut AppView,
-) {
-    egui::Frame::group(ui.style())
-        .fill(egui::Color32::WHITE)
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                badge(
-                    ui,
-                    item.media_type.label(),
-                    egui::Color32::from_rgb(37, 99, 235),
-                );
-                ui.label(item.detected_at.format("%H:%M:%S").to_string());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        egui::Grid::new("sniffing_table")
+            .striped(true)
+            .spacing([14.0, 5.0])
+            .show(ui, |ui| {
+                for item in items {
+                    ui.label(compact_text(&item.title, 28));
+                    ui.label(item.media_type.label());
+                    ui.label("-");
+                    ui.label("已嗅探");
+                    ui.label(item.detected_at.format("%H:%M:%S").to_string());
+                    small_url_cell(ui, &item.url);
                     let supported = matches!(
                         item.media_type,
                         MediaType::Hls | MediaType::Mp4 | MediaType::Webm | MediaType::Unknown
@@ -344,25 +450,25 @@ fn resource_card(
                         .clicked()
                     {
                         let media_id = item.id;
-                        enqueue_download(state.clone(), item);
+                        enqueue_download(state.clone(), &item);
                         state.write(|app| app.detected.retain(|media| media.id != media_id));
                         *active_view = AppView::Downloading;
                     }
-                    if !supported {
-                        ui.label("DASH 暂未支持");
+                    ui.end_row();
+
+                    if item.media_type == MediaType::Hls {
+                        ui.label("");
+                        ui.label("");
+                        ui.label("");
+                        ui.label("");
+                        ui.label("");
+                        ui.horizontal(|ui| draw_hls_quality_selector(state, ui, &item));
+                        ui.label("");
+                        ui.end_row();
                     }
-                });
+                }
             });
-            ui.add_space(6.0);
-            ui.strong(compact_text(&item.title, 84));
-            small_url(ui, "地址", &item.url);
-            if let Some(page_url) = &item.page_url {
-                small_url(ui, "来源页", page_url);
-            }
-            if item.media_type == MediaType::Hls {
-                draw_hls_quality_selector(state, ui, item);
-            }
-        });
+    });
 }
 
 fn draw_hls_quality_selector(state: &SharedState, ui: &mut egui::Ui, item: &MediaItem) {
@@ -389,51 +495,47 @@ fn draw_hls_quality_selector(state: &SharedState, ui: &mut egui::Ui, item: &Medi
         })
         .unwrap_or_else(|| "自动最高码率".to_string());
 
-    ui.horizontal(|ui| {
-        ui.label("清晰度");
-        egui::ComboBox::from_id_salt(format!("hls-quality-{}", item.id))
-            .selected_text(selected_label)
-            .show_ui(ui, |ui| {
-                for variant in &item.hls_variants {
-                    let label = variant.label();
-                    let selected = selected_url.as_deref() == Some(variant.url.as_str());
-                    if ui.selectable_label(selected, label).clicked() {
-                        let url = variant.url.clone();
-                        state.write(|app| {
-                            if let Some(media) =
-                                app.detected.iter_mut().find(|media| media.id == item.id)
-                            {
-                                media.selected_hls_variant_url = Some(url);
-                                media.hls_status = Some("已切换清晰度".to_string());
-                            }
-                        });
-                    }
+    ui.label("清晰度");
+    egui::ComboBox::from_id_salt(format!("hls-quality-{}", item.id))
+        .selected_text(selected_label)
+        .show_ui(ui, |ui| {
+            for variant in &item.hls_variants {
+                let label = variant.label();
+                let selected = selected_url.as_deref() == Some(variant.url.as_str());
+                if ui.selectable_label(selected, label).clicked() {
+                    let url = variant.url.clone();
+                    state.write(|app| {
+                        if let Some(media) =
+                            app.detected.iter_mut().find(|media| media.id == item.id)
+                        {
+                            media.selected_hls_variant_url = Some(url);
+                            media.hls_status = Some("已切换清晰度".to_string());
+                        }
+                    });
                 }
-            });
-    });
-
-    if let Some(status) = &item.hls_status {
-        ui.small(status);
-    }
+            }
+        });
 }
 
-fn draw_task_list(
+fn draw_task_table(
     state: &SharedState,
     ui: &mut egui::Ui,
     selected_task_id: &mut Option<Uuid>,
     completed_only: bool,
 ) {
-    let title = if completed_only {
-        "已下载"
-    } else {
-        "下载中"
-    };
-    let subtitle = if completed_only {
-        "已完成的下载记录，可按需删除记录"
-    } else {
-        "等待、下载、暂停和失败的任务都在这里处理"
-    };
-    section_header(ui, title, subtitle);
+    table_header(
+        ui,
+        &[
+            "文件名",
+            "大小",
+            "状态",
+            "进度",
+            "剩余时间",
+            "下载速度",
+            "最后连接时间",
+            "描述",
+        ],
+    );
 
     let tasks = state.read(|app| {
         app.tasks
@@ -451,79 +553,84 @@ fn draw_task_list(
 
     if tasks.is_empty() {
         let message = if completed_only {
-            "还没有已下载记录"
+            "还没有已下载记录。"
         } else {
-            "当前没有下载任务"
+            "当前没有下载任务。"
         };
-        empty_state(ui, message, "从嗅探资源中点击下载后会出现在这里。");
+        empty_row(ui, message);
         return;
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        for task in tasks {
-            task_card(state, ui, &task, selected_task_id, completed_only);
-            ui.add_space(8.0);
-        }
-    });
-
-    ui.separator();
-    draw_task_detail(state, ui, *selected_task_id);
-}
-
-fn task_card(
-    state: &SharedState,
-    ui: &mut egui::Ui,
-    task: &crate::state::DownloadTask,
-    selected_task_id: &mut Option<Uuid>,
-    completed_only: bool,
-) {
-    egui::Frame::group(ui.style())
-        .fill(egui::Color32::WHITE)
-        .inner_margin(egui::Margin::same(12))
+        egui::Grid::new(if completed_only {
+            "completed_table"
+        } else {
+            "downloading_table"
+        })
+        .striped(true)
+        .spacing([14.0, 5.0])
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong(compact_text(&task.title, 74));
+            for task in tasks {
+                let selected = *selected_task_id == Some(task.id);
+                if ui
+                    .selectable_label(selected, compact_text(&task.title, 28))
+                    .clicked()
+                {
+                    *selected_task_id = Some(task.id);
+                }
+                ui.label(
+                    task.total_bytes
+                        .map(human_bytes)
+                        .unwrap_or_else(|| "-".to_string()),
+                );
                 status_label(ui, task.status);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if completed_only && ui.button("删除记录").clicked() {
+                ui.add(
+                    egui::ProgressBar::new(task.progress)
+                        .show_percentage()
+                        .desired_width(110.0),
+                );
+                ui.label(if task.status == DownloadStatus::Completed {
+                    "0 秒"
+                } else {
+                    "-"
+                });
+                ui.label("-");
+                ui.label("-");
+                ui.horizontal(|ui| {
+                    ui.label(compact_text(&task.message, 34));
+                    if completed_only && ui.button("删除").clicked() {
                         let id = task.id;
                         state.write(|app| app.tasks.retain(|task| task.id != id));
                         if *selected_task_id == Some(id) {
                             *selected_task_id = None;
                         }
-                    }
-                    if !completed_only && ui.button("详情").clicked() {
-                        *selected_task_id = Some(task.id);
-                    }
-                });
-            });
-
-            small_url(ui, "地址", &task.url);
-            ui.add(egui::ProgressBar::new(task.progress).show_percentage());
-            ui.label(&task.message);
-            if let Some(total) = task.total_bytes {
-                ui.small(format!("总大小: {}", human_bytes(total)));
-            }
-
-            if !completed_only {
-                ui.horizontal(|ui| {
-                    if matches!(
-                        task.status,
-                        DownloadStatus::Queued | DownloadStatus::Downloading
-                    ) && ui.button("暂停").clicked()
-                    {
-                        pause_download(state.clone(), task.id);
-                    }
-                    if matches!(
-                        task.status,
-                        DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Queued
-                    ) && ui.button("恢复").clicked()
-                    {
-                        resume_download(state.clone(), task.id);
+                    } else if !completed_only {
+                        if matches!(
+                            task.status,
+                            DownloadStatus::Queued | DownloadStatus::Downloading
+                        ) && ui.button("暂停").clicked()
+                        {
+                            pause_download(state.clone(), task.id);
+                        }
+                        if matches!(
+                            task.status,
+                            DownloadStatus::Paused
+                                | DownloadStatus::Failed
+                                | DownloadStatus::Queued
+                        ) && ui.button("继续").clicked()
+                        {
+                            resume_download(state.clone(), task.id);
+                        }
                     }
                 });
+                ui.end_row();
             }
         });
+    });
+
+    if !completed_only {
+        draw_task_detail(state, ui, *selected_task_id);
+    }
 }
 
 fn draw_task_detail(state: &SharedState, ui: &mut egui::Ui, selected_task_id: Option<Uuid>) {
@@ -548,8 +655,9 @@ fn draw_task_detail(state: &SharedState, ui: &mut egui::Ui, selected_task_id: Op
         .join("manifest.json");
     let manifest = read_manifest_summary(&manifest_path);
 
+    ui.separator();
     egui::CollapsingHeader::new("分片详情")
-        .default_open(true)
+        .default_open(false)
         .show(ui, |ui| {
             ui.label(format!("任务 ID: {}", task.id));
             ui.label(format!("媒体类型: {}", task.media_type.label()));
@@ -575,7 +683,7 @@ fn draw_task_detail(state: &SharedState, ui: &mut egui::Ui, selected_task_id: Op
                         ));
                     }
                     egui::ScrollArea::vertical()
-                        .max_height(140.0)
+                        .max_height(120.0)
                         .show(ui, |ui| {
                             for line in summary.preview_lines {
                                 ui.small(line);
@@ -720,29 +828,26 @@ fn read_manifest_summary(path: &PathBuf) -> Option<ManifestSummary> {
     })
 }
 
-fn section_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        ui.vertical(|ui| {
-            ui.heading(title);
-            ui.small(subtitle);
-        });
-    });
-    ui.add_space(12.0);
-}
-
-fn empty_state(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    egui::Frame::group(ui.style())
-        .fill(egui::Color32::WHITE)
-        .inner_margin(egui::Margin::same(16))
+fn table_header(ui: &mut egui::Ui, columns: &[&str]) {
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(245, 245, 245))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(214, 214, 214),
+        ))
+        .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
-            ui.strong(title);
-            ui.label(subtitle);
+            ui.horizontal(|ui| {
+                for column in columns {
+                    ui.add_sized([120.0, 18.0], egui::Label::new(*column));
+                }
+            });
         });
 }
 
-fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    ui.colored_label(color, text);
+fn empty_row(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(12.0);
+    ui.label(text);
 }
 
 fn status_label(ui: &mut egui::Ui, status: DownloadStatus) {
@@ -790,10 +895,9 @@ fn load_system_chinese_font() -> Option<Vec<u8>> {
     candidates.iter().find_map(|path| fs::read(path).ok())
 }
 
-fn small_url(ui: &mut egui::Ui, label: &str, url: &str) {
-    let text = format!("{label}: {}", compact_text(url, 96));
-    let response = ui.add(egui::Label::new(egui::RichText::new(text).small()).wrap());
-    response.on_hover_text(url);
+fn small_url_cell(ui: &mut egui::Ui, url: &str) {
+    ui.add(egui::Label::new(compact_text(url, 34)))
+        .on_hover_text(url);
 }
 
 fn compact_text(value: &str, max_chars: usize) -> String {
