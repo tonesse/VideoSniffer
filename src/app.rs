@@ -5,7 +5,7 @@ use crate::{
 };
 use eframe::egui;
 use serde_json::Value;
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::{collections::HashSet, fs, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 
 pub struct VideoSnifferApp {
@@ -16,7 +16,9 @@ pub struct VideoSnifferApp {
 }
 
 impl VideoSnifferApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        install_chinese_font(&cc.egui_ctx);
+
         let state = SharedState::new();
         let (save_dir_input, port) = state.read(|app| {
             (
@@ -70,10 +72,23 @@ impl eframe::App for VideoSnifferApp {
 
                 ui.separator();
                 ui.label("保存位置");
-                let response = ui.text_edit_singleline(&mut self.save_dir_input);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.save_dir_input)
+                        .desired_width(f32::INFINITY),
+                );
                 if response.lost_focus() {
                     let value = self.save_dir_input.clone();
                     self.state.write(|app| app.settings.save_dir = value.into());
+                }
+                if ui.button("选择文件夹...").clicked()
+                    && let Some(folder) = rfd::FileDialog::new()
+                        .set_title("选择视频保存位置")
+                        .set_directory(PathBuf::from(&self.save_dir_input))
+                        .pick_folder()
+                {
+                    self.save_dir_input = folder.to_string_lossy().to_string();
+                    let value = folder;
+                    self.state.write(|app| app.settings.save_dir = value);
                 }
 
                 ui.add_space(8.0);
@@ -112,9 +127,9 @@ fn draw_detected(state: &SharedState, ui: &mut egui::Ui) {
                     ui.label(item.detected_at.format("%H:%M:%S").to_string());
                 });
                 ui.strong(&item.title);
-                ui.small(&item.url);
+                small_url(ui, "地址", &item.url);
                 if let Some(page_url) = &item.page_url {
-                    ui.small(format!("来源页: {page_url}"));
+                    small_url(ui, "来源页", page_url);
                 }
                 if item.media_type == MediaType::Hls {
                     draw_hls_quality_selector(state, ui, &item);
@@ -212,7 +227,7 @@ fn draw_tasks(state: &SharedState, ui: &mut egui::Ui, selected_task_id: &mut Opt
                     ui.strong(&task.title);
                     status_label(ui, task.status);
                 });
-                ui.small(&task.url);
+                small_url(ui, "地址", &task.url);
                 ui.add(egui::ProgressBar::new(task.progress).show_percentage());
                 ui.label(&task.message);
                 if let Some(total) = task.total_bytes {
@@ -281,7 +296,7 @@ fn draw_task_detail(state: &SharedState, ui: &mut egui::Ui, selected_task_id: Op
             ui.strong(&task.title);
             status_label(ui, task.status);
         });
-        ui.small(&task.url);
+        small_url(ui, "地址", &task.url);
         ui.label(format!("任务 ID: {}", task.id));
         ui.label(format!("媒体类型: {}", task.media_type.label()));
         ui.label(format!("进度: {:.1}%", task.progress * 100.0));
@@ -464,6 +479,55 @@ fn status_label(ui: &mut egui::Ui, status: DownloadStatus) {
         DownloadStatus::Unsupported => egui::Color32::from_rgb(217, 119, 6),
     };
     ui.colored_label(color, status.label());
+}
+
+fn install_chinese_font(ctx: &egui::Context) {
+    let Some(font_bytes) = load_system_chinese_font() else {
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "system_chinese".to_owned(),
+        Arc::new(egui::FontData::from_owned(font_bytes)),
+    );
+
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, "system_chinese".to_owned());
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+fn load_system_chinese_font() -> Option<Vec<u8>> {
+    let candidates = [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+    ];
+
+    candidates.iter().find_map(|path| fs::read(path).ok())
+}
+
+fn small_url(ui: &mut egui::Ui, label: &str, url: &str) {
+    let text = format!("{label}: {}", compact_text(url, 120));
+    let response = ui.add(egui::Label::new(egui::RichText::new(text).small()).wrap());
+    response.on_hover_text(url);
+}
+
+fn compact_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }
 
 fn human_bytes(bytes: u64) -> String {
