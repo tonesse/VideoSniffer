@@ -1,23 +1,30 @@
 use crate::{
-    hls::{choose_highest_variant, parse_hls_playlist, sort_variants_highest_first},
+    hls::{
+        HlsKey, HlsKeyMethod, HlsSegment, choose_highest_variant, parse_hls_playlist,
+        sort_variants_highest_first,
+    },
     state::{
         DownloadStatus, DownloadTask, HeaderPair, MediaItem, MediaType, SharedState,
         filename_from_url,
     },
 };
+use aes::Aes128;
 use anyhow::{Context, anyhow};
+use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use reqwest::{
     Client,
     header::{ACCEPT_RANGES, CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue, RANGE},
 };
 use sanitize_filename::sanitize;
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::Semaphore,
+    sync::{Mutex, Semaphore},
 };
 use uuid::Uuid;
+
+type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
 pub fn enqueue_download(state: SharedState, media: &MediaItem) {
     let task = DownloadTask {
@@ -225,9 +232,6 @@ async fn download_hls(
             .await?;
         playlist = parse_hls_playlist(&playlist_url, &playlist_text)?;
     }
-    if playlist.encrypted {
-        return Err(anyhow!("当前版本检测到加密 HLS，暂未处理 EXT-X-KEY 解密"));
-    }
     if playlist.segments.is_empty() {
         return Err(anyhow!("HLS 播放列表中没有可下载分片"));
     }
@@ -246,25 +250,30 @@ async fn download_hls(
     });
 
     let semaphore = Arc::new(Semaphore::new(part_threads));
+    let key_cache = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
     let mut handles = Vec::with_capacity(total_segments);
 
-    for (index, segment_url) in playlist.segments.iter().cloned().enumerate() {
+    for (index, segment) in playlist.segments.iter().cloned().enumerate() {
         let permit = semaphore.clone().acquire_owned().await?;
         let state = state.clone();
         let client = client.clone();
         let header_map = header_map.clone();
         let task_dir = task_dir.clone();
+        let key_cache = key_cache.clone();
 
         handles.push(tokio::spawn(async move {
             let _permit = permit;
             let bytes = client
-                .get(segment_url)
-                .headers(header_map)
+                .get(&segment.url)
+                .headers(header_map.clone())
                 .send()
                 .await?
                 .error_for_status()?
                 .bytes()
                 .await?;
+            let bytes =
+                decrypt_hls_segment(&client, header_map, &key_cache, &segment, bytes.as_ref())
+                    .await?;
             let part_path = task_dir.join(format!("{index:06}.part"));
             fs::write(part_path, &bytes).await?;
             add_hls_segment(
@@ -308,6 +317,58 @@ async fn download_hls(
     });
 
     Ok(())
+}
+
+async fn decrypt_hls_segment(
+    client: &Client,
+    headers: HeaderMap,
+    key_cache: &Mutex<HashMap<String, Vec<u8>>>,
+    segment: &HlsSegment,
+    bytes: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let Some(key) = &segment.key else {
+        return Ok(bytes.to_vec());
+    };
+
+    match key.method {
+        HlsKeyMethod::Aes128 => {
+            let key_bytes = fetch_hls_key(client, headers, key_cache, key).await?;
+            Aes128CbcDec::new(key_bytes.as_slice().into(), (&key.iv).into())
+                .decrypt_padded_vec_mut::<Pkcs7>(bytes)
+                .map_err(|err| anyhow!("HLS 分片 AES-128 解密失败: {err}"))
+        }
+        HlsKeyMethod::Unsupported => Err(anyhow!("当前 HLS 加密 METHOD 暂不支持")),
+    }
+}
+
+async fn fetch_hls_key(
+    client: &Client,
+    headers: HeaderMap,
+    key_cache: &Mutex<HashMap<String, Vec<u8>>>,
+    key: &HlsKey,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(cached) = key_cache.lock().await.get(&key.uri).cloned() {
+        return Ok(cached);
+    }
+
+    let bytes = client
+        .get(&key.uri)
+        .headers(headers)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    if bytes.len() != 16 {
+        return Err(anyhow!("HLS AES-128 key 长度不是 16 字节"));
+    }
+
+    let key_bytes = bytes.to_vec();
+    key_cache
+        .lock()
+        .await
+        .insert(key.uri.clone(), key_bytes.clone());
+    Ok(key_bytes)
 }
 
 async fn download_single(
