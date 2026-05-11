@@ -60,6 +60,9 @@ async fn receive_media(
     if !looks_like_media(&candidate) {
         return with_cors((StatusCode::NO_CONTENT, "ignored"));
     }
+    if should_ignore_media_noise(&candidate) {
+        return with_cors((StatusCode::NO_CONTENT, "ignored"));
+    }
 
     if looks_like_segmented_mp4(&candidate) {
         let hls_media_id = state.write(|app| accept_segmented_mp4(app, candidate));
@@ -169,11 +172,44 @@ fn looks_like_media(candidate: &MediaCandidate) -> bool {
         || url.contains(".mpd")
         || url.contains(".mp4")
         || url.contains(".m4s")
+        || is_hls_segment_url(&url)
         || url.contains(".webm")
         || mime.contains("video/")
         || mime.contains("audio/")
         || mime.contains("mpegurl")
         || mime.contains("dash")
+}
+
+fn should_ignore_media_noise(candidate: &MediaCandidate) -> bool {
+    let url = candidate.url.to_ascii_lowercase();
+    let mime = candidate
+        .mime_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if is_hls_segment_url(&url) || mime.contains("mp2t") {
+        return true;
+    }
+
+    let is_manifest = url.contains(".m3u8")
+        || url.contains(".mpd")
+        || mime.contains("mpegurl")
+        || mime.contains("dash");
+    let is_separated_stream = looks_like_segmented_mp4(candidate);
+    let is_audio = looks_like_audio(candidate);
+
+    !is_manifest
+        && !is_separated_stream
+        && !is_audio
+        && candidate
+            .content_length
+            .is_some_and(|length| length > 0 && length < 1024)
+}
+
+fn is_hls_segment_url(url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or(url);
+    path.ends_with(".ts")
 }
 
 fn looks_like_audio(candidate: &MediaCandidate) -> bool {
@@ -473,5 +509,55 @@ mod tests {
     #[test]
     fn m4s_bandwidth_score_prefers_higher_stream() {
         assert!(stream_score(BILI_AUDIO, None, None) > stream_score(BILI_VIDEO, None, None));
+    }
+
+    #[test]
+    fn ignores_hls_ts_segments() {
+        let candidate = MediaCandidate {
+            url: "https://example.com/video/segment.f322063.1.ts?index=1&start=11200&end=23200"
+                .to_string(),
+            page_url: None,
+            title: None,
+            mime_type: Some("video/mp2t".to_string()),
+            content_length: Some(1_200_000),
+            duration_seconds: None,
+            method: Some("GET".to_string()),
+            request_headers: Vec::new(),
+        };
+
+        assert!(looks_like_media(&candidate));
+        assert!(should_ignore_media_noise(&candidate));
+    }
+
+    #[test]
+    fn ignores_tiny_non_manifest_media_noise() {
+        let candidate = MediaCandidate {
+            url: "https://vip.video.qq.com/rpc/trpc.hongji.ping.webm".to_string(),
+            page_url: None,
+            title: None,
+            mime_type: Some("video/webm".to_string()),
+            content_length: Some(11),
+            duration_seconds: None,
+            method: Some("GET".to_string()),
+            request_headers: Vec::new(),
+        };
+
+        assert!(should_ignore_media_noise(&candidate));
+    }
+
+    #[test]
+    fn keeps_small_hls_manifest() {
+        let candidate = MediaCandidate {
+            url: "https://api.hls.one/cache/video/index.m3u8".to_string(),
+            page_url: None,
+            title: None,
+            mime_type: Some("application/vnd.apple.mpegurl".to_string()),
+            content_length: Some(60 * 1024),
+            duration_seconds: None,
+            method: Some("GET".to_string()),
+            request_headers: Vec::new(),
+        };
+
+        assert!(!should_ignore_media_noise(&candidate));
     }
 }

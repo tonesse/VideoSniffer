@@ -12,6 +12,7 @@ use crate::{
 use aes::Aes128;
 use anyhow::{Context, anyhow};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use chrono::Utc;
 use reqwest::{
     Client, StatusCode,
     header::{
@@ -53,6 +54,10 @@ pub fn enqueue_download(state: SharedState, media: &MediaItem) {
         downloaded_bytes: 0,
         total_bytes: None,
         completed_segments: 0,
+        speed_bytes_per_second: None,
+        eta_seconds: None,
+        last_progress_at: None,
+        last_progress_bytes: 0,
         message: "等待下载".to_string(),
     };
     let task_id = task.id;
@@ -70,6 +75,8 @@ pub fn pause_download(state: SharedState, task_id: Uuid) {
             )
         {
             task.status = DownloadStatus::Paused;
+            task.speed_bytes_per_second = None;
+            task.eta_seconds = None;
             task.message = "已暂停".to_string();
         }
     });
@@ -98,6 +105,10 @@ pub fn resume_download(state: SharedState, task_id: Uuid) {
             task.completed_segments = 0;
             task.total_bytes = None;
         }
+        task.speed_bytes_per_second = None;
+        task.eta_seconds = None;
+        task.last_progress_at = None;
+        task.last_progress_bytes = task.downloaded_bytes;
 
         true
     });
@@ -317,9 +328,36 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
         return Err(anyhow!("HLS 播放列表中没有可下载分片"));
     }
 
+    let output = save_dir.join(output_filename(&task));
+    if hls_playlist_needs_ffmpeg(&playlist)
+        && let Some(ffmpeg_output) = download_hls_with_ffmpeg_if_possible(
+            state.clone(),
+            task_id,
+            &playlist_url,
+            &headers,
+            &output,
+        )
+        .await?
+    {
+        let final_output = merge_audio_sidecar_if_needed(
+            state.clone(),
+            task_id,
+            client,
+            task.audio.as_ref(),
+            &ffmpeg_output,
+            &save_dir,
+        )
+        .await?;
+        mark_completed(
+            &state,
+            task_id,
+            format!("HLS 下载完成: {}", final_output.display()),
+        );
+        return Ok(());
+    }
+
     let task_dir = save_dir.join(".parts").join(task_id.to_string());
     fs::create_dir_all(&task_dir).await?;
-    let output = save_dir.join(output_filename(&task));
     let manifest_path = task_dir.join("manifest.json");
     let mut manifest = load_part_manifest(&manifest_path).await;
     manifest.task_id = task_id.to_string();
@@ -463,6 +501,14 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn hls_playlist_needs_ffmpeg(playlist: &crate::hls::HlsPlaylist) -> bool {
+    playlist.has_init_map
+        || playlist
+            .segments
+            .iter()
+            .any(|segment| segment.byte_range.is_some())
+}
+
 #[derive(Clone)]
 struct HlsPartJob {
     index: usize,
@@ -497,13 +543,58 @@ async fn download_hls_part(
         return Ok(());
     }
 
-    let bytes = bytes_with_retry(
-        client.get(&job.segment.url).headers(header_map.clone()),
-        "下载 HLS 分片",
-    )
-    .await?;
+    let mut request_headers = header_map.clone();
+    if let Some(byte_range) = job.segment.byte_range {
+        request_headers.insert(
+            RANGE,
+            HeaderValue::from_str(&format!(
+                "bytes={}-{}",
+                byte_range.offset,
+                byte_range
+                    .offset
+                    .saturating_add(byte_range.length)
+                    .saturating_sub(1)
+            ))
+            .context("invalid HLS byte range header")?,
+        );
+    }
+
+    let bytes = if let Some(byte_range) = job.segment.byte_range {
+        let response = send_with_retry(
+            client.get(&job.segment.url).headers(request_headers),
+            "下载 HLS byte-range 分片",
+        )
+        .await?;
+        let status = response.status();
+        let content_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let bytes = response
+            .bytes()
+            .await
+            .context("读取 HLS byte-range 分片响应失败")?;
+        if status != StatusCode::PARTIAL_CONTENT && bytes.len() as u64 != byte_range.length {
+            return Err(anyhow!(
+                "HLS byte-range 分片响应不匹配，期望 {} 字节或 206，实际状态 {}，Content-Length={:?}，读取 {} 字节",
+                byte_range.length,
+                status,
+                content_length,
+                bytes.len()
+            ));
+        }
+        bytes
+    } else {
+        bytes_with_retry(
+            client.get(&job.segment.url).headers(request_headers),
+            "下载 HLS 分片",
+        )
+        .await?
+    };
     let bytes =
         decrypt_hls_segment(client, header_map, key_cache, &job.segment, bytes.as_ref()).await?;
+    let bytes = strip_hls_segment_prefix_noise(&bytes);
     fs::write(part_path, &bytes).await?;
     mark_hls_part_complete(manifest_path, manifest, job.index, bytes.len() as u64).await?;
     add_hls_segment(
@@ -536,6 +627,38 @@ async fn decrypt_hls_segment(
         }
         HlsKeyMethod::Unsupported => Err(anyhow!("当前 HLS 加密 METHOD 暂不支持")),
     }
+}
+
+fn strip_hls_segment_prefix_noise(bytes: &[u8]) -> Vec<u8> {
+    let Some(offset) = find_mpeg_ts_sync_offset(bytes) else {
+        return bytes.to_vec();
+    };
+
+    if offset == 0 {
+        bytes.to_vec()
+    } else {
+        bytes[offset..].to_vec()
+    }
+}
+
+fn find_mpeg_ts_sync_offset(bytes: &[u8]) -> Option<usize> {
+    const TS_PACKET_SIZE: usize = 188;
+    const MAX_PREFIX_SCAN: usize = 4096;
+    let max_offset = bytes.len().min(MAX_PREFIX_SCAN);
+
+    for offset in 0..max_offset {
+        let mut probes = 0;
+        let mut position = offset;
+        while position < bytes.len() && bytes[position] == 0x47 {
+            probes += 1;
+            if probes >= 3 {
+                return Some(offset);
+            }
+            position = position.saturating_add(TS_PACKET_SIZE);
+        }
+    }
+
+    None
 }
 
 async fn fetch_hls_key(
@@ -872,6 +995,7 @@ fn update_progress(state: &SharedState, task_id: Uuid, downloaded: u64, total: O
                 .map(|total| downloaded as f32 / total.max(1) as f32)
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
+            update_transfer_stats(task, downloaded, total);
             task.message = format_bytes(downloaded);
         }
     });
@@ -883,6 +1007,7 @@ fn add_downloaded(state: &SharedState, task_id: Uuid, bytes: u64, total: u64) {
             task.downloaded_bytes = task.downloaded_bytes.saturating_add(bytes).min(total);
             task.total_bytes = Some(total);
             task.progress = (task.downloaded_bytes as f32 / total.max(1) as f32).clamp(0.0, 1.0);
+            update_transfer_stats(task, task.downloaded_bytes, Some(total));
             task.message = format!(
                 "{} / {}",
                 format_bytes(task.downloaded_bytes),
@@ -905,6 +1030,7 @@ fn add_hls_segment(
             task.completed_segments = task.completed_segments.saturating_add(1);
             task.progress =
                 (task.completed_segments as f32 / total_segments.max(1) as f32).clamp(0.0, 1.0);
+            update_transfer_stats(task, task.downloaded_bytes, None);
             task.message = format!(
                 "已下载分片 {}/{total_segments}，最近完成 #{segment_number}，累计 {}",
                 task.completed_segments,
@@ -919,9 +1045,37 @@ fn mark_completed(state: &SharedState, task_id: Uuid, message: String) {
         if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
             task.status = DownloadStatus::Completed;
             task.progress = 1.0;
+            task.speed_bytes_per_second = None;
+            task.eta_seconds = Some(0.0);
             task.message = message;
         }
     });
+}
+
+fn update_transfer_stats(task: &mut DownloadTask, current_bytes: u64, total: Option<u64>) {
+    let now = Utc::now();
+    if let Some(last_at) = task.last_progress_at {
+        let elapsed = now.signed_duration_since(last_at).num_milliseconds().max(0) as f64 / 1000.0;
+        let delta = current_bytes.saturating_sub(task.last_progress_bytes);
+        if elapsed >= 0.2 && delta > 0 {
+            let instant_speed = delta as f64 / elapsed;
+            task.speed_bytes_per_second = Some(match task.speed_bytes_per_second {
+                Some(previous) => previous * 0.7 + instant_speed * 0.3,
+                None => instant_speed,
+            });
+        }
+    }
+
+    task.last_progress_at = Some(now);
+    task.last_progress_bytes = current_bytes;
+
+    task.eta_seconds = match (total, task.speed_bytes_per_second) {
+        (Some(total), Some(speed)) if speed > 1.0 && total > current_bytes => {
+            Some((total - current_bytes) as f64 / speed)
+        }
+        (Some(_), _) if task.progress >= 1.0 => Some(0.0),
+        _ => None,
+    };
 }
 
 struct RemuxResult {
@@ -984,6 +1138,89 @@ async fn remux_hls_output_if_possible(ts_path: &Path) -> anyhow::Result<RemuxRes
             output_path: ts_path,
         }),
     }
+}
+
+async fn download_hls_with_ffmpeg_if_possible(
+    state: SharedState,
+    task_id: Uuid,
+    playlist_url: &str,
+    headers: &[HeaderPair],
+    output: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let ffmpeg_path = ffmpeg_path();
+    let mp4_path = output.with_extension("mp4");
+    let playlist_url = playlist_url.to_string();
+    let header_text = ffmpeg_header_text(headers);
+    let mp4_path_for_task = mp4_path.clone();
+
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.message = "正在使用 ffmpeg 直接下载 HLS".to_string();
+            task.progress = 0.0;
+            task.speed_bytes_per_second = None;
+            task.eta_seconds = None;
+        }
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut command = Command::new(&ffmpeg_path);
+        command.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-protocol_whitelist",
+            "file,http,https,tcp,tls,crypto",
+            "-allowed_extensions",
+            "ALL",
+        ]);
+        if !header_text.is_empty() {
+            command.args(["-headers", &header_text]);
+        }
+        command.args([
+            "-i",
+            &playlist_url,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            &mp4_path_for_task.to_string_lossy(),
+        ]);
+        command.output()
+    })
+    .await
+    .context("等待 ffmpeg HLS 下载任务失败")?;
+
+    match result {
+        Ok(output) if output.status.success() => Ok(Some(mp4_path)),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            state.write(|app| {
+                if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+                    task.message = format!("ffmpeg 直下 HLS 失败，回退分片下载: {stderr}");
+                }
+            });
+            Ok(None)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            state.write(|app| {
+                if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+                    task.message = format!("启动 ffmpeg 失败，回退分片下载: {err}");
+                }
+            });
+            Ok(None)
+        }
+    }
+}
+
+fn ffmpeg_header_text(headers: &[HeaderPair]) -> String {
+    headers
+        .iter()
+        .filter(|header| !header.name.eq_ignore_ascii_case("range"))
+        .filter(|header| !header.name.trim().is_empty() && !header.value.trim().is_empty())
+        .map(|header| format!("{}: {}\r\n", header.name.trim(), header.value.trim()))
+        .collect::<String>()
 }
 
 async fn merge_audio_sidecar_if_needed(
@@ -1160,6 +1397,8 @@ fn mark_failed(state: &SharedState, task_id: Uuid, message: String) {
         if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
             if task.status != DownloadStatus::Paused {
                 task.status = DownloadStatus::Failed;
+                task.speed_bytes_per_second = None;
+                task.eta_seconds = None;
                 task.message = message;
             }
         }
@@ -1370,5 +1609,40 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes / KB)
     } else {
         format!("{bytes:.0} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_png_prefix_before_ts_packets() {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend([0_u8; 24]);
+        let ts_offset = bytes.len();
+        for index in 0..3 {
+            let mut packet = vec![0_u8; 188];
+            packet[0] = 0x47;
+            packet[1] = index;
+            bytes.extend(packet);
+        }
+
+        let stripped = strip_hls_segment_prefix_noise(&bytes);
+        assert_eq!(stripped.len(), 188 * 3);
+        assert_eq!(stripped[0], 0x47);
+        assert_eq!(&stripped, &bytes[ts_offset..]);
+    }
+
+    #[test]
+    fn keeps_clean_ts_packets() {
+        let mut bytes = Vec::new();
+        for _ in 0..3 {
+            let mut packet = vec![0_u8; 188];
+            packet[0] = 0x47;
+            bytes.extend(packet);
+        }
+
+        assert_eq!(strip_hls_segment_prefix_noise(&bytes), bytes);
     }
 }

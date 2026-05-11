@@ -825,19 +825,19 @@ fn draw_task_table(
                     ui.add(
                         egui::ProgressBar::new(task.progress)
                             .show_percentage()
-                            .desired_width(columns[4] - 8.0),
+                            .desired_width(ui.available_width()),
                     );
                 });
                 table_cell(
                     ui,
                     columns[5],
                     if task.status == DownloadStatus::Completed {
-                        "0 秒"
+                        "0 秒".to_string()
                     } else {
-                        "-"
+                        human_eta(&task)
                     },
                 );
-                table_cell(ui, columns[6], "-");
+                table_cell(ui, columns[6], human_speed(task.speed_bytes_per_second));
                 table_cell(ui, columns[7], "-");
                 cell_ui(ui, columns[8], |ui| {
                     ui.horizontal(|ui| {
@@ -1322,11 +1322,17 @@ fn selectable_table_cell(
 }
 
 fn cell_ui(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 22.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        add_contents,
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
+    let inner = rect.shrink2(egui::vec2(4.0, 1.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
+    child.set_clip_rect(rect);
+    child.set_min_width(inner.width());
+    child.set_max_width(inner.width());
+    add_contents(&mut child);
 }
 
 fn elide_to_width(ui: &egui::Ui, text: &str, width: f32) -> (String, bool) {
@@ -1456,5 +1462,22 @@ fn human_duration(duration_seconds: Option<f64>) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn human_speed(speed_bytes_per_second: Option<f64>) -> String {
+    match speed_bytes_per_second.filter(|speed| speed.is_finite() && *speed > 0.0) {
+        Some(speed) => format!("{}/s", human_bytes(speed.round() as u64)),
+        None => "-".to_string(),
+    }
+}
+
+fn human_eta(task: &DownloadTask) -> String {
+    match task
+        .eta_seconds
+        .filter(|eta| eta.is_finite() && *eta >= 0.0)
+    {
+        Some(eta) => human_duration(Some(eta)),
+        None => "-".to_string(),
     }
 }

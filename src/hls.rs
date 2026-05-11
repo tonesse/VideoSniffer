@@ -72,6 +72,7 @@ async fn analyze_hls_variants(state: SharedState, media_id: Uuid) -> anyhow::Res
 pub struct HlsPlaylist {
     pub segments: Vec<HlsSegment>,
     pub variants: Vec<HlsVariant>,
+    pub has_init_map: bool,
 }
 
 impl HlsPlaylist {
@@ -84,6 +85,13 @@ impl HlsPlaylist {
 pub struct HlsSegment {
     pub url: String,
     pub key: Option<HlsKey>,
+    pub byte_range: Option<HlsByteRange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HlsByteRange {
+    pub offset: u64,
+    pub length: u64,
 }
 
 #[derive(Clone)]
@@ -105,6 +113,9 @@ pub fn parse_hls_playlist(base_url: &str, text: &str) -> anyhow::Result<HlsPlayl
     let mut variants = Vec::new();
     let mut pending_variant: Option<HlsVariantInfo> = None;
     let mut current_key: Option<PendingHlsKey> = None;
+    let mut pending_byte_range: Option<HlsByteRange> = None;
+    let mut next_byte_range_offset = 0_u64;
+    let mut has_init_map = false;
     let mut next_sequence = 0_u64;
 
     for raw_line in text.lines() {
@@ -122,6 +133,16 @@ pub fn parse_hls_playlist(base_url: &str, text: &str) -> anyhow::Result<HlsPlayl
         }
         if let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") {
             pending_variant = Some(parse_variant_info(attrs));
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+            let byte_range = parse_byte_range(value, next_byte_range_offset)?;
+            next_byte_range_offset = byte_range.offset.saturating_add(byte_range.length);
+            pending_byte_range = Some(byte_range);
+            continue;
+        }
+        if line.starts_with("#EXT-X-MAP:") {
+            has_init_map = true;
             continue;
         }
         if line.starts_with('#') {
@@ -142,12 +163,17 @@ pub fn parse_hls_playlist(base_url: &str, text: &str) -> anyhow::Result<HlsPlayl
                 key: current_key
                     .as_ref()
                     .map(|key| key.to_segment_key(next_sequence)),
+                byte_range: pending_byte_range.take(),
             });
             next_sequence = next_sequence.saturating_add(1);
         }
     }
 
-    Ok(HlsPlaylist { segments, variants })
+    Ok(HlsPlaylist {
+        segments,
+        variants,
+        has_init_map,
+    })
 }
 
 pub fn choose_highest_variant(variants: &[HlsVariant]) -> anyhow::Result<&HlsVariant> {
@@ -240,6 +266,19 @@ fn parse_key_info(base: &reqwest::Url, attrs: &str) -> anyhow::Result<Option<Pen
     };
 
     Ok(Some(PendingHlsKey { method, uri, iv }))
+}
+
+fn parse_byte_range(value: &str, default_offset: u64) -> anyhow::Result<HlsByteRange> {
+    let value = value.trim();
+    let (length, offset) = match value.split_once('@') {
+        Some((length, offset)) => (length, offset.parse::<u64>()?),
+        None => (value, default_offset),
+    };
+
+    Ok(HlsByteRange {
+        offset,
+        length: length.parse::<u64>()?,
+    })
 }
 
 fn parse_iv(value: &str) -> anyhow::Result<[u8; 16]> {
@@ -388,5 +427,36 @@ seg-100.ts
         let second = playlist.segments[1].key.as_ref().expect("second key");
         assert_eq!(&first.iv[8..], &99_u64.to_be_bytes());
         assert_eq!(&second.iv[8..], &100_u64.to_be_bytes());
+    }
+
+    #[test]
+    fn parses_byte_range_segments() {
+        let playlist = parse_hls_playlist(
+            "https://cdn.example.com/live/index.m3u8",
+            r#"
+#EXTM3U
+#EXT-X-BYTERANGE:12001@11200
+media.ts
+#EXT-X-BYTERANGE:800
+media.ts
+"#,
+        )
+        .expect("playlist parses");
+
+        assert_eq!(playlist.segments.len(), 2);
+        assert_eq!(
+            playlist.segments[0].byte_range,
+            Some(HlsByteRange {
+                offset: 11200,
+                length: 12001
+            })
+        );
+        assert_eq!(
+            playlist.segments[1].byte_range,
+            Some(HlsByteRange {
+                offset: 23201,
+                length: 800
+            })
+        );
     }
 }

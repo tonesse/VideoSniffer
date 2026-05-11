@@ -17,16 +17,25 @@ pub struct SharedState {
     inner: Arc<Mutex<AppState>>,
     revision: Arc<AtomicU64>,
     persist_path: Arc<PathBuf>,
+    settings_path: Arc<PathBuf>,
     active_tasks: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl SharedState {
     pub fn new() -> Self {
         let persist_path = state_file_path();
+        let settings_path = settings_file_path();
         let mut app_state = load_state(&persist_path).unwrap_or_else(default_state);
+        if let Some(settings) = load_settings(&settings_path) {
+            app_state.settings = settings;
+        }
         app_state.detected.clear();
 
         for task in &mut app_state.tasks {
+            task.speed_bytes_per_second = None;
+            task.eta_seconds = None;
+            task.last_progress_at = None;
+            task.last_progress_bytes = task.downloaded_bytes;
             if matches!(
                 task.status,
                 DownloadStatus::Downloading | DownloadStatus::Queued
@@ -40,6 +49,7 @@ impl SharedState {
             inner: Arc::new(Mutex::new(app_state)),
             revision: Arc::new(AtomicU64::new(1)),
             persist_path: Arc::new(persist_path),
+            settings_path: Arc::new(settings_path),
             active_tasks: Arc::new(Mutex::new(HashSet::new())),
         };
         state.persist();
@@ -93,6 +103,16 @@ impl SharedState {
         if let Ok(json) = serde_json::to_string_pretty(snapshot) {
             let _ = fs::write(self.persist_path.as_ref(), json);
         }
+        self.persist_settings(&snapshot.settings);
+    }
+
+    fn persist_settings(&self, settings: &Settings) {
+        if let Some(parent) = self.settings_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            let _ = fs::write(self.settings_path.as_ref(), json);
+        }
     }
 }
 
@@ -123,12 +143,26 @@ fn load_state(path: &PathBuf) -> Option<AppState> {
     serde_json::from_str(&json).ok()
 }
 
+fn load_settings(path: &PathBuf) -> Option<Settings> {
+    let json = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
 fn state_file_path() -> PathBuf {
     dirs::config_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("VideoSniffer")
         .join("state.json")
+}
+
+fn settings_file_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("setting.json")
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -365,6 +399,14 @@ pub struct DownloadTask {
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
     pub completed_segments: usize,
+    #[serde(default)]
+    pub speed_bytes_per_second: Option<f64>,
+    #[serde(default)]
+    pub eta_seconds: Option<f64>,
+    #[serde(default)]
+    pub last_progress_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_progress_bytes: u64,
     pub message: String,
 }
 

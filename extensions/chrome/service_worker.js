@@ -28,12 +28,33 @@ function looksLikeMedia(details) {
   const mime = (details.responseHeaders || [])
     .find((header) => header.name.toLowerCase() === "content-type")
     ?.value?.toLowerCase() || "";
+  const length = contentLength(details.responseHeaders);
+
+  if (shouldIgnoreMediaNoise(url, mime, length)) {
+    return false;
+  }
 
   return MEDIA_PATTERNS.some((pattern) => url.includes(pattern)) ||
     mime.includes("video/") ||
     mime.includes("audio/") ||
     mime.includes("mpegurl") ||
     mime.includes("dash");
+}
+
+function shouldIgnoreMediaNoise(url, mime, length) {
+  const path = url.split("?")[0];
+  const isManifest = url.includes(".m3u8") || url.includes(".mpd") ||
+    mime.includes("mpegurl") || mime.includes("dash");
+  const isSeparatedStream = url.includes(".m4s");
+  const isAudio = mime.includes("audio/") ||
+    [".m4a", ".aac", ".mp3", ".opus"].some((pattern) => path.endsWith(pattern));
+
+  if (path.endsWith(".ts") || mime.includes("mp2t")) {
+    return true;
+  }
+
+  return !isManifest && !isSeparatedStream && !isAudio &&
+    Number.isFinite(length) && length > 0 && length < 1024;
 }
 
 function headerValue(headers, name) {
