@@ -1,67 +1,68 @@
 # VideoSniffer
 
-Rust Windows desktop app prototype for browser video sniffing and multi-threaded downloads.
+VideoSniffer 是一个基于 Rust 的 Windows 桌面视频嗅探与下载工具。它通过浏览器扩展捕获视频网络请求，并在桌面应用中提供嗅探列表、手动新建任务、多线程下载、断点恢复和已下载记录管理。
 
-## Architecture
+## 当前功能
 
-- Browser extension captures media network responses.
-- Extension sends candidate video URLs to `http://127.0.0.1:37651/api/media`.
-- Extension preserves key playback request headers such as Cookie, Referer, Origin and User-Agent for the downloader.
-- Rust app shows detected media and download queue.
-- Detected media, settings and tasks are persisted locally so the app can restore them after restart.
-- Network requests use timeout, retry, exponential backoff and clearer source-error classification.
-- Failed HLS or range parts are deprioritized and retried later so other parts can continue first.
-- Incomplete HLS and range downloads keep a temporary manifest at `.parts/{task_id}/manifest.json` so restart/resume skips completed parts.
-- Downloader supports direct MP4/WEBM/unknown file URLs with ranged multi-thread download when the server supports `Accept-Ranges: bytes`.
-- HLS media playlists are downloaded by fetching segments concurrently, merging into `.ts`, and remuxing to `.mp4` with `ffmpeg` when available.
-- HLS master playlists are analyzed automatically. The app defaults to the highest bitrate variant and lets the user switch quality in the UI before downloading.
-- Non-DRM HLS `EXT-X-KEY:METHOD=AES-128` streams are decrypted when the playlist exposes the key URL and IV.
-- DASH parsing is intentionally separated for the next step.
+- 浏览器视频资源嗅探，支持 Chrome / Edge 扩展上报视频地址。
+- 支持手动新建下载任务，直接输入视频地址下载。
+- 支持 MP4、WEBM、HLS 资源下载。
+- 直链媒体在服务端支持 `Accept-Ranges: bytes` 时使用多线程分片下载。
+- HLS 支持并发分片下载、合并为 TS，并在可用时通过 ffmpeg remux 为 MP4。
+- HLS master playlist 会自动选择最高码率，也可以在 UI 中切换清晰度。
+- 支持非 DRM 的 HLS AES-128 解密。
+- 下载任务支持暂停、恢复、失败重试和断点续传。
+- 分片下载进度会写入临时 manifest，应用重启后可以跳过已完成分片。
+- 支持设置保存目录、线程数量、请求重试次数和分片重试次数。
+- 已下载记录支持删除，双击文件名可打开本地文件；如果文件不存在，会自动删除记录。
+- 嗅探资源地址支持复制。
 
-## Run
+## 运行
 
 ```powershell
 cargo run
 ```
 
-## Load Browser Extension
+## 加载浏览器扩展
 
-1. Open Chrome or Edge extensions page.
-2. Enable developer mode.
-3. Load unpacked extension from `extensions/chrome`.
-4. Start the Rust app, then play a video in the browser.
+1. 打开 Chrome 或 Edge 的扩展管理页面。
+2. 开启“开发者模式”。
+3. 选择“加载已解压的扩展程序”。
+4. 选择项目目录下的 `extensions/chrome`。
+5. 启动 VideoSniffer 后，在浏览器中播放视频即可嗅探。
 
-## First Version Scope
+扩展会把视频地址、页面来源、标题、Content-Type、Content-Length 以及下载所需的 Cookie、Referer、Origin、User-Agent 等请求头发送到本地应用。
 
-- Local sniffer endpoint.
-- Desktop UI.
-- Save directory setting.
-- Detected media list.
-- Request header forwarding from the browser extension.
-- Download queue.
-- Pause/resume controls for active tasks.
-- Persisted task history and settings.
-- Task detail panel showing temporary manifest progress for completed and pending parts.
-- Retry handling for playlist, key, segment, direct and range requests.
-- Per-part retry queue for HLS segments and ranged direct downloads.
-- Partial-file reuse for completed HLS segments and completed range parts after pause, crash or app restart.
-- Multi-thread ranged download for direct media files.
-- Non-encrypted HLS media playlist segment download and merge.
-- HLS master playlist quality discovery, highest-bitrate default selection, and manual quality switching.
-- AES-128 HLS segment decryption using playlist-provided `EXT-X-KEY` metadata.
-- Optional HLS TS-to-MP4 remuxing through `ffmpeg -c copy`, with TS fallback when ffmpeg is unavailable.
-- Bundled ffmpeg at `third_party/ffmpeg/ffmpeg.exe`; package builds should include it next to the app or under `bin/ffmpeg.exe`.
+## 打包
 
-## Bundled FFmpeg
+直接运行：
 
-The app resolves ffmpeg in this order:
+```bat
+scripts\package.bat
+```
 
-1. `VIDEOSNIFFER_FFMPEG` environment variable.
-2. `ffmpeg.exe` next to the packaged app.
-3. `bin/ffmpeg.exe` next to the packaged app.
-4. `third_party/ffmpeg/ffmpeg.exe` in the repo or packaged directory.
-5. `ffmpeg` from system `PATH`.
+打包结果会生成在 `dist` 目录中：
 
-## Next Implementation Step
+- `dist\VideoSniffer\VideoSniffer.exe`
+- `dist\VideoSniffer\bin\ffmpeg.exe`，如果本地存在 ffmpeg
+- `dist\browser-extension\VideoSniffer-Chrome-Extension.zip`
 
-- Add per-part retry history and last error visibility.
+`dist`、`target` 和本地 ffmpeg 工具文件不会提交到仓库。
+
+## FFmpeg
+
+HLS 下载完成后会优先尝试通过 ffmpeg 将 TS remux 为 MP4。应用按以下顺序查找 ffmpeg：
+
+1. `VIDEOSNIFFER_FFMPEG` 环境变量。
+2. 打包目录中的 `ffmpeg.exe`。
+3. 打包目录中的 `bin\ffmpeg.exe`。
+4. 项目或打包目录中的 `third_party\ffmpeg\ffmpeg.exe`。
+5. 系统 `PATH` 中的 `ffmpeg`。
+
+如果没有找到 ffmpeg，应用会保留 TS 文件。
+
+## 注意事项
+
+- 某些网站的视频地址有时效性，过期后需要重新嗅探。
+- 如果更新了扩展代码，需要在浏览器扩展管理页重新加载扩展。
+- 嗅探列表只保留当前页面捕获到且尚未下载的资源，离开嗅探页后未下载资源会被清理。
