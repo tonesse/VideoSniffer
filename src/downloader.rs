@@ -13,8 +13,11 @@ use aes::Aes128;
 use anyhow::{Context, anyhow};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use reqwest::{
-    Client,
-    header::{ACCEPT_RANGES, CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue, RANGE},
+    Client, StatusCode,
+    header::{
+        ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderMap, HeaderName,
+        HeaderValue, RANGE,
+    },
 };
 use sanitize_filename::sanitize;
 use serde::{Deserialize, Serialize};
@@ -193,6 +196,7 @@ async fn run_task(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
         .and_then(|value| value.to_str().ok())
         .map(|value| value.eq_ignore_ascii_case("bytes"))
         .unwrap_or(false);
+    reject_error_content_type(&head, "直链媒体响应")?;
 
     state.write(|app| {
         if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
@@ -527,6 +531,7 @@ async fn download_single(
     output: PathBuf,
 ) -> anyhow::Result<()> {
     let mut response = send_with_retry(client.get(url).headers(headers), "下载直链媒体").await?;
+    reject_error_content_type(&response, "直链媒体响应")?;
     let total = response.content_length();
     let mut file = File::create(output).await?;
     let mut downloaded = 0_u64;
@@ -536,6 +541,15 @@ async fn download_single(
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
         update_progress(&state, task_id, downloaded, total);
+    }
+    if let Some(total) = total
+        && downloaded != total
+    {
+        return Err(anyhow!(
+            "直链媒体下载不完整，预期 {} 字节，实际 {} 字节",
+            total,
+            downloaded
+        ));
     }
 
     file.flush().await?;
@@ -661,6 +675,14 @@ async fn download_ranged(
     for handle in handles {
         handle.await??;
     }
+    let actual_len = fs::metadata(&output).await?.len();
+    if actual_len != total {
+        return Err(anyhow!(
+            "Range 下载文件大小不匹配，预期 {} 字节，实际 {} 字节",
+            total,
+            actual_len
+        ));
+    }
 
     fs::remove_dir_all(task_dir).await.ok();
     Ok(())
@@ -699,15 +721,91 @@ async fn download_range_part(
             .context("invalid range header")?,
     );
     let mut response = send_with_retry(client.get(url).headers(headers), "下载直链分片").await?;
+    validate_range_response(&response, job, total)?;
     let mut file = File::options().write(true).open(output).await?;
     file.seek(std::io::SeekFrom::Start(job.start)).await?;
+    let expected_len = job.end.saturating_sub(job.start).saturating_add(1);
+    let mut written = 0_u64;
 
     while let Some(chunk) = response.chunk().await? {
         wait_if_paused(state, task_id).await?;
+        let chunk_len = chunk.len() as u64;
+        if written.saturating_add(chunk_len) > expected_len {
+            return Err(anyhow!(
+                "Range 分片 {}-{} 返回内容超过预期大小",
+                job.start,
+                job.end
+            ));
+        }
         file.write_all(&chunk).await?;
-        add_downloaded(state, task_id, chunk.len() as u64, total);
+        written += chunk_len;
+        add_downloaded(state, task_id, chunk_len, total);
+    }
+    if written != expected_len {
+        return Err(anyhow!(
+            "Range 分片 {}-{} 下载不完整，预期 {} 字节，实际 {} 字节",
+            job.start,
+            job.end,
+            expected_len,
+            written
+        ));
     }
     mark_range_part_complete(manifest_path, manifest, job.start, job.end).await?;
+    Ok(())
+}
+
+fn reject_error_content_type(
+    response: &reqwest::Response,
+    description: &str,
+) -> anyhow::Result<()> {
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if content_type.starts_with("text/")
+        || content_type.contains("json")
+        || content_type.contains("xml")
+    {
+        return Err(anyhow!(
+            "{description}: 源站返回的不是视频内容，Content-Type={content_type}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_range_response(
+    response: &reqwest::Response,
+    job: &RangePartJob,
+    total: u64,
+) -> anyhow::Result<()> {
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(anyhow!(
+            "Range 分片 {}-{} 响应状态异常，预期 206，实际 {}",
+            job.start,
+            job.end,
+            response.status()
+        ));
+    }
+
+    let Some(content_range) = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(anyhow!("Range 分片响应缺少 Content-Range"));
+    };
+
+    let expected = format!("bytes {}-{}/{}", job.start, job.end, total);
+    if content_range != expected {
+        return Err(anyhow!(
+            "Range 分片 Content-Range 不匹配，预期 {expected}，实际 {content_range}"
+        ));
+    }
+
     Ok(())
 }
 
@@ -1053,6 +1151,9 @@ fn to_header_map(headers: &[HeaderPair]) -> HeaderMap {
             HeaderName::from_str(&pair.name),
             HeaderValue::from_str(&pair.value),
         ) {
+            if name == RANGE {
+                continue;
+            }
             map.insert(name, value);
         }
     }
