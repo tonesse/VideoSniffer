@@ -6,7 +6,12 @@ const MEDIA_PATTERNS = [
   ".m3u8",
   ".mpd",
   ".mp4",
-  ".webm"
+  ".webm",
+  ".m4s",
+  ".m4a",
+  ".aac",
+  ".mp3",
+  ".opus"
 ];
 
 const FORWARDED_REQUEST_HEADERS = new Set([
@@ -26,6 +31,7 @@ function looksLikeMedia(details) {
 
   return MEDIA_PATTERNS.some((pattern) => url.includes(pattern)) ||
     mime.includes("video/") ||
+    mime.includes("audio/") ||
     mime.includes("mpegurl") ||
     mime.includes("dash");
 }
@@ -38,6 +44,27 @@ function contentLength(headers) {
   const value = headerValue(headers, "content-length");
   const parsed = value ? Number.parseInt(value, 10) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+async function tabMediaDurationSeconds(tabId) {
+  if (tabId < 0) {
+    return null;
+  }
+
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const durations = [...document.querySelectorAll("video,audio")]
+          .map((media) => media.duration)
+          .filter((duration) => Number.isFinite(duration) && duration > 0);
+        return durations.length ? Math.max(...durations) : null;
+      }
+    });
+    return Number.isFinite(injection?.result) ? injection.result : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 function captureForwardedHeaders(details) {
@@ -77,6 +104,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     const tab = details.tabId >= 0
       ? await chrome.tabs.get(details.tabId).catch(() => null)
       : null;
+    const durationSeconds = await tabMediaDurationSeconds(details.tabId);
 
     const cached = requestHeaderCache.get(details.requestId);
     requestHeaderCache.delete(details.requestId);
@@ -90,6 +118,7 @@ chrome.webRequest.onHeadersReceived.addListener(
       title: tab?.title || null,
       mime_type: headerValue(details.responseHeaders, "content-type") || null,
       content_length: contentLength(details.responseHeaders),
+      duration_seconds: durationSeconds,
       method: details.method,
       request_headers: [
         ...capturedHeaders,

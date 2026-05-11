@@ -104,6 +104,7 @@ fn default_state() -> AppState {
 
     AppState {
         detected: VecDeque::new(),
+        pending_audio: VecDeque::new(),
         tasks: Vec::new(),
         settings: Settings {
             save_dir: download_dir,
@@ -133,6 +134,8 @@ fn state_file_path() -> PathBuf {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct AppState {
     pub detected: VecDeque<MediaItem>,
+    #[serde(default)]
+    pub pending_audio: VecDeque<MediaSidecar>,
     pub tasks: Vec<DownloadTask>,
     pub settings: Settings,
 }
@@ -181,8 +184,35 @@ pub struct MediaCandidate {
     pub mime_type: Option<String>,
     #[serde(default)]
     pub content_length: Option<u64>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
     pub method: Option<String>,
     pub request_headers: Vec<HeaderPair>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MediaSidecar {
+    pub url: String,
+    pub page_url: Option<String>,
+    pub title: Option<String>,
+    #[serde(default)]
+    pub content_length: Option<u64>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
+    pub headers: Vec<HeaderPair>,
+}
+
+impl From<MediaCandidate> for MediaSidecar {
+    fn from(candidate: MediaCandidate) -> Self {
+        Self {
+            url: candidate.url,
+            page_url: candidate.page_url,
+            title: candidate.title,
+            content_length: candidate.content_length,
+            duration_seconds: candidate.duration_seconds,
+            headers: candidate.request_headers,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -200,7 +230,11 @@ pub struct MediaItem {
     pub media_type: MediaType,
     #[serde(default)]
     pub content_length: Option<u64>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
     pub headers: Vec<HeaderPair>,
+    #[serde(default)]
+    pub audio: Option<MediaSidecar>,
     pub hls_variants: Vec<HlsVariant>,
     pub selected_hls_variant_url: Option<String>,
     pub hls_status: Option<String>,
@@ -264,7 +298,10 @@ impl MediaType {
             Self::Hls
         } else if lower_url.contains(".mpd") || lower_mime.contains("dash") {
             Self::Dash
-        } else if lower_url.contains(".mp4") || lower_mime.contains("mp4") {
+        } else if lower_url.contains(".mp4")
+            || lower_url.contains(".m4s")
+            || lower_mime.contains("mp4")
+        {
             Self::Mp4
         } else if lower_url.contains(".webm") || lower_mime.contains("webm") {
             Self::Webm
@@ -300,7 +337,9 @@ impl From<MediaCandidate> for MediaItem {
             title,
             media_type,
             content_length: candidate.content_length,
+            duration_seconds: candidate.duration_seconds,
             headers: candidate.request_headers,
+            audio: None,
             hls_variants: Vec::new(),
             selected_hls_variant_url: None,
             hls_status: None,
@@ -317,6 +356,10 @@ pub struct DownloadTask {
     pub url: String,
     pub media_type: MediaType,
     pub headers: Vec<HeaderPair>,
+    #[serde(default)]
+    pub audio: Option<MediaSidecar>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
     pub status: DownloadStatus,
     pub progress: f32,
     pub downloaded_bytes: u64,

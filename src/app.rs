@@ -21,8 +21,8 @@ enum AppView {
     Completed,
 }
 
-const DEFAULT_SNIFF_COLUMNS: [f32; 7] = [210.0, 70.0, 90.0, 90.0, 90.0, 300.0, 80.0];
-const DEFAULT_TASK_COLUMNS: [f32; 8] = [220.0, 90.0, 80.0, 120.0, 90.0, 90.0, 150.0, 260.0];
+const DEFAULT_SNIFF_COLUMNS: [f32; 8] = [210.0, 70.0, 90.0, 80.0, 90.0, 90.0, 300.0, 80.0];
+const DEFAULT_TASK_COLUMNS: [f32; 9] = [220.0, 90.0, 80.0, 80.0, 120.0, 90.0, 90.0, 150.0, 260.0];
 
 struct SettingsDraft {
     save_dir: String,
@@ -66,8 +66,8 @@ pub struct VideoSnifferApp {
     pending_delete: Option<DeleteConfirmation>,
     settings_draft: SettingsDraft,
     manual_download: ManualDownloadDraft,
-    sniff_columns: [f32; 7],
-    task_columns: [f32; 8],
+    sniff_columns: [f32; 8],
+    task_columns: [f32; 9],
     last_revision: u64,
     selected_task_id: Option<Uuid>,
 }
@@ -148,6 +148,7 @@ impl VideoSnifferApp {
             title,
             mime_type: None,
             content_length: None,
+            duration_seconds: None,
             method: Some("GET".to_string()),
             request_headers: Vec::new(),
         };
@@ -627,11 +628,20 @@ fn draw_sniffing_table(
     state: &SharedState,
     ui: &mut egui::Ui,
     active_view: &mut AppView,
-    columns: &mut [f32; 7],
+    columns: &mut [f32; 8],
 ) {
     table_header(
         ui,
-        &["文件名", "类型", "大小", "状态", "时间", "地址", "操作"],
+        &[
+            "文件名",
+            "类型",
+            "大小",
+            "时长",
+            "状态",
+            "时间",
+            "地址",
+            "操作",
+        ],
         columns,
     );
 
@@ -656,10 +666,11 @@ fn draw_sniffing_table(
                         .map(human_bytes)
                         .unwrap_or_else(|| "未知".to_string()),
                 );
-                table_cell(ui, columns[3], "已嗅探");
-                table_cell(ui, columns[4], local_time(item.detected_at));
-                copyable_table_cell(ui, columns[5], &item.url);
-                cell_ui(ui, columns[6], |ui| {
+                table_cell(ui, columns[3], human_duration(item.duration_seconds));
+                table_cell(ui, columns[4], "已嗅探");
+                table_cell(ui, columns[5], local_time(item.detected_at));
+                copyable_table_cell(ui, columns[6], &item.url);
+                cell_ui(ui, columns[7], |ui| {
                     let supported = matches!(
                         item.media_type,
                         MediaType::Hls | MediaType::Mp4 | MediaType::Webm | MediaType::Unknown
@@ -683,10 +694,11 @@ fn draw_sniffing_table(
                     table_cell(ui, columns[2], "");
                     table_cell(ui, columns[3], "");
                     table_cell(ui, columns[4], "");
-                    cell_ui(ui, columns[5], |ui| {
+                    table_cell(ui, columns[5], "");
+                    cell_ui(ui, columns[6], |ui| {
                         draw_hls_quality_selector(state, ui, &item);
                     });
-                    table_cell(ui, columns[6], "");
+                    table_cell(ui, columns[7], "");
                 });
             }
         }
@@ -744,7 +756,7 @@ fn draw_task_table(
     ui: &mut egui::Ui,
     selected_task_id: &mut Option<Uuid>,
     completed_only: bool,
-    columns: &mut [f32; 8],
+    columns: &mut [f32; 9],
     pending_delete: &mut Option<DeleteConfirmation>,
 ) {
     table_header(
@@ -752,6 +764,7 @@ fn draw_task_table(
         &[
             "文件名",
             "大小",
+            "时长",
             "状态",
             "进度",
             "剩余时间",
@@ -804,31 +817,32 @@ fn draw_task_table(
                         .map(human_bytes)
                         .unwrap_or_else(|| "-".to_string()),
                 );
-                cell_ui(ui, columns[2], |ui| {
+                table_cell(ui, columns[2], human_duration(task.duration_seconds));
+                cell_ui(ui, columns[3], |ui| {
                     status_label(ui, task.status);
                 });
-                cell_ui(ui, columns[3], |ui| {
+                cell_ui(ui, columns[4], |ui| {
                     ui.add(
                         egui::ProgressBar::new(task.progress)
                             .show_percentage()
-                            .desired_width(columns[3] - 8.0),
+                            .desired_width(columns[4] - 8.0),
                     );
                 });
                 table_cell(
                     ui,
-                    columns[4],
+                    columns[5],
                     if task.status == DownloadStatus::Completed {
                         "0 秒"
                     } else {
                         "-"
                     },
                 );
-                table_cell(ui, columns[5], "-");
                 table_cell(ui, columns[6], "-");
-                cell_ui(ui, columns[7], |ui| {
+                table_cell(ui, columns[7], "-");
+                cell_ui(ui, columns[8], |ui| {
                     ui.horizontal(|ui| {
                         let action_width = if completed_only { 54.0 } else { 104.0 };
-                        table_cell(ui, (columns[7] - action_width).max(48.0), &task.message);
+                        table_cell(ui, (columns[8] - action_width).max(48.0), &task.message);
                         if completed_only && ui.button("删除").clicked() {
                             prepare_completed_delete(
                                 state,
@@ -1425,5 +1439,22 @@ fn human_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes / KB)
     } else {
         format!("{bytes:.0} B")
+    }
+}
+
+fn human_duration(duration_seconds: Option<f64>) -> String {
+    let Some(seconds) = duration_seconds.filter(|value| value.is_finite() && *value >= 0.0) else {
+        return "未知".to_string();
+    };
+
+    let total = seconds.round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }

@@ -5,7 +5,7 @@ use crate::{
     },
     net::{build_client, bytes_with_retry, send_with_retry, set_retry_attempts, text_with_retry},
     state::{
-        DownloadStatus, DownloadTask, HeaderPair, MediaItem, MediaType, SharedState,
+        DownloadStatus, DownloadTask, HeaderPair, MediaItem, MediaSidecar, MediaType, SharedState,
         filename_from_url,
     },
 };
@@ -46,6 +46,8 @@ pub fn enqueue_download(state: SharedState, media: &MediaItem) {
         url: media.selected_hls_url(),
         media_type: media.media_type,
         headers: media.headers.clone(),
+        audio: media.audio.clone(),
+        duration_seconds: media.duration_seconds,
         status: DownloadStatus::Queued,
         progress: 0.0,
         downloaded_bytes: 0,
@@ -215,10 +217,10 @@ async fn run_task(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
             download_ranged(
                 state.clone(),
                 task_id,
-                client,
+                client.clone(),
                 header_map,
                 task.url,
-                output,
+                output.clone(),
                 total,
                 part_threads,
                 part_retry_attempts,
@@ -226,11 +228,32 @@ async fn run_task(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
             .await?;
         }
         _ => {
-            download_single(state.clone(), task_id, client, header_map, task.url, output).await?;
+            download_single(
+                state.clone(),
+                task_id,
+                client.clone(),
+                header_map,
+                task.url,
+                output.clone(),
+            )
+            .await?;
         }
     }
 
-    mark_completed(&state, task_id, "下载完成".to_string());
+    let final_output = merge_audio_sidecar_if_needed(
+        state.clone(),
+        task_id,
+        client,
+        task.audio.as_ref(),
+        &output,
+        &save_dir,
+    )
+    .await?;
+    mark_completed(
+        &state,
+        task_id,
+        format!("下载完成: {}", final_output.display()),
+    );
     Ok(())
 }
 
@@ -417,9 +440,26 @@ async fn download_hls(state: SharedState, task_id: Uuid) -> anyhow::Result<()> {
     }
     output_file.flush().await?;
     let remux = remux_hls_output_if_possible(&output).await?;
+    let final_output = merge_audio_sidecar_if_needed(
+        state.clone(),
+        task_id,
+        client,
+        task.audio.as_ref(),
+        &remux.output_path,
+        &save_dir,
+    )
+    .await?;
     fs::remove_dir_all(task_dir).await.ok();
 
-    mark_completed(&state, task_id, format!("HLS 合并完成: {}", remux.message));
+    mark_completed(
+        &state,
+        task_id,
+        format!(
+            "HLS 合并完成: {}; 输出文件: {}",
+            remux.message,
+            final_output.display()
+        ),
+    );
     Ok(())
 }
 
@@ -886,6 +926,7 @@ fn mark_completed(state: &SharedState, task_id: Uuid, message: String) {
 
 struct RemuxResult {
     message: String,
+    output_path: PathBuf,
 }
 
 async fn remux_hls_output_if_possible(ts_path: &Path) -> anyhow::Result<RemuxResult> {
@@ -920,6 +961,7 @@ async fn remux_hls_output_if_possible(ts_path: &Path) -> anyhow::Result<RemuxRes
             fs::remove_file(ts_path).await.ok();
             Ok(RemuxResult {
                 message: format!("已 remux 为 MP4: {}", mp4_path.display()),
+                output_path: mp4_path,
             })
         }
         Ok(output) => {
@@ -930,14 +972,150 @@ async fn remux_hls_output_if_possible(ts_path: &Path) -> anyhow::Result<RemuxRes
                     ts_path.display(),
                     stderr.trim()
                 ),
+                output_path: ts_path,
             })
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(RemuxResult {
             message: format!("已保留 TS: {}；未检测到 ffmpeg", ts_path.display()),
+            output_path: ts_path,
         }),
         Err(err) => Ok(RemuxResult {
             message: format!("已保留 TS: {}；启动 ffmpeg 失败: {err}", ts_path.display()),
+            output_path: ts_path,
         }),
+    }
+}
+
+async fn merge_audio_sidecar_if_needed(
+    state: SharedState,
+    task_id: Uuid,
+    client: Client,
+    audio: Option<&MediaSidecar>,
+    video_path: &Path,
+    save_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let Some(audio) = audio else {
+        return Ok(video_path.to_path_buf());
+    };
+
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.message = "正在下载音频轨".to_string();
+        }
+    });
+
+    wait_if_paused(&state, task_id).await?;
+    let audio_path = save_dir
+        .join(".parts")
+        .join(task_id.to_string())
+        .join(audio_filename(audio));
+    if let Some(parent) = audio_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    download_sidecar_audio(
+        state.clone(),
+        task_id,
+        client,
+        to_header_map(&audio.headers),
+        audio.url.clone(),
+        audio_path.clone(),
+    )
+    .await?;
+
+    state.write(|app| {
+        if let Some(task) = app.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.message = "正在合并音视频".to_string();
+        }
+    });
+
+    let merged_path = video_path.with_extension("merged.mp4");
+    let final_path = video_path.with_extension("mp4");
+    let ffmpeg_path = ffmpeg_path();
+    let video = video_path.to_path_buf();
+    let audio_input = audio_path.clone();
+    let merged = merged_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        Command::new(&ffmpeg_path)
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                &video.to_string_lossy(),
+                "-i",
+                &audio_input.to_string_lossy(),
+                "-map",
+                "0:v:0?",
+                "-map",
+                "1:v:0?",
+                "-map",
+                "0:a:0?",
+                "-map",
+                "1:a:0?",
+                "-c",
+                "copy",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                &merged.to_string_lossy(),
+            ])
+            .output()
+    })
+    .await
+    .context("等待 ffmpeg 音视频合并任务失败")?;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            if final_path != video_path {
+                fs::remove_file(video_path).await.ok();
+            }
+            if final_path.exists() {
+                fs::remove_file(&final_path).await.ok();
+            }
+            fs::rename(&merged_path, &final_path).await?;
+            fs::remove_file(audio_path).await.ok();
+            Ok(final_path)
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(anyhow!("ffmpeg 音视频合并失败: {}", stderr.trim()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(anyhow!("未找到 ffmpeg，无法合并分离音轨"))
+        }
+        Err(err) => Err(anyhow!("启动 ffmpeg 音视频合并失败: {err}")),
+    }
+}
+
+async fn download_sidecar_audio(
+    state: SharedState,
+    task_id: Uuid,
+    client: Client,
+    headers: HeaderMap,
+    url: String,
+    output: PathBuf,
+) -> anyhow::Result<()> {
+    let mut response = send_with_retry(client.get(url).headers(headers), "下载音频轨").await?;
+    reject_error_content_type(&response, "音频轨响应")?;
+    let mut file = File::create(output).await?;
+
+    while let Some(chunk) = response.chunk().await? {
+        wait_if_paused(&state, task_id).await?;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+fn audio_filename(audio: &MediaSidecar) -> String {
+    let filename = sanitize(filename_from_url(&audio.url));
+    if filename.trim().is_empty() {
+        "audio.m4a".to_string()
+    } else {
+        filename
     }
 }
 

@@ -3,7 +3,7 @@
   "name": "VideoSniffer Bridge",
   "version": "0.1.0",
   "description": "Capture media requests and send them to the local VideoSniffer app.",
-  "permissions": ["webRequest", "tabs"],
+  "permissions": ["webRequest", "tabs", "scripting"],
   "host_permissions": ["<all_urls>", "http://127.0.0.1:37651/*"],
   "background": {
     "service_worker": "service_worker.js"
