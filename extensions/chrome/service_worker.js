@@ -14,7 +14,6 @@ const FORWARDED_REQUEST_HEADERS = new Set([
   "accept-language",
   "cookie",
   "origin",
-  "range",
   "referer",
   "user-agent"
 ]);
