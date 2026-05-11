@@ -40,6 +40,11 @@ struct ManualDownloadDraft {
     error: Option<String>,
 }
 
+struct DeleteConfirmation {
+    task_ids: Vec<Uuid>,
+    file_paths: Vec<PathBuf>,
+}
+
 impl SettingsDraft {
     fn from_settings(settings: &Settings) -> Self {
         Self {
@@ -58,6 +63,7 @@ pub struct VideoSnifferApp {
     active_view: AppView,
     show_settings: bool,
     show_new_task: bool,
+    pending_delete: Option<DeleteConfirmation>,
     settings_draft: SettingsDraft,
     manual_download: ManualDownloadDraft,
     sniff_columns: [f32; 7],
@@ -80,6 +86,7 @@ impl VideoSnifferApp {
             active_view: AppView::Sniffing,
             show_settings: false,
             show_new_task: false,
+            pending_delete: None,
             settings_draft: SettingsDraft::from_settings(&settings),
             manual_download: ManualDownloadDraft::default(),
             sniff_columns: DEFAULT_SNIFF_COLUMNS,
@@ -182,6 +189,15 @@ impl VideoSnifferApp {
         let Some(selected) = self.selected_task_id else {
             return;
         };
+        if self.active_view == AppView::Completed {
+            prepare_completed_delete(
+                &self.state,
+                &mut self.selected_task_id,
+                vec![selected],
+                &mut self.pending_delete,
+            );
+            return;
+        }
         self.state
             .write(|app| app.tasks.retain(|task| task.id != selected));
         self.selected_task_id = None;
@@ -199,10 +215,20 @@ impl VideoSnifferApp {
                 });
             }
             AppView::Completed => {
-                self.state.write(|app| {
+                let ids = self.state.read(|app| {
                     app.tasks
-                        .retain(|task| task.status != DownloadStatus::Completed)
+                        .iter()
+                        .filter(|task| task.status == DownloadStatus::Completed)
+                        .map(|task| task.id)
+                        .collect::<Vec<_>>()
                 });
+                prepare_completed_delete(
+                    &self.state,
+                    &mut self.selected_task_id,
+                    ids,
+                    &mut self.pending_delete,
+                );
+                return;
             }
         }
         self.selected_task_id = None;
@@ -221,6 +247,7 @@ impl eframe::App for VideoSnifferApp {
         self.draw_left_categories(ctx);
         self.draw_settings_window(ctx);
         self.draw_new_task_window(ctx);
+        self.draw_delete_confirmation(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::WHITE))
@@ -237,6 +264,7 @@ impl eframe::App for VideoSnifferApp {
                     &mut self.selected_task_id,
                     false,
                     &mut self.task_columns,
+                    &mut self.pending_delete,
                 ),
                 AppView::Completed => draw_task_table(
                     &self.state,
@@ -244,6 +272,7 @@ impl eframe::App for VideoSnifferApp {
                     &mut self.selected_task_id,
                     true,
                     &mut self.task_columns,
+                    &mut self.pending_delete,
                 ),
             });
     }
@@ -507,6 +536,71 @@ impl VideoSnifferApp {
             self.submit_manual_download();
         }
     }
+
+    fn draw_delete_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending_delete else {
+            return;
+        };
+
+        let file_count = pending.file_paths.len();
+        let task_count = pending.task_ids.len();
+        let preview = pending
+            .file_paths
+            .iter()
+            .take(3)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let mut delete_files = false;
+        let mut delete_records_only = false;
+        let mut cancel = false;
+
+        egui::Window::new("删除已下载记录")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "将删除 {task_count} 条已下载记录，检测到 {file_count} 个本地文件。"
+                ));
+                ui.label("是否同时删除对应文件？");
+                ui.add_space(8.0);
+                for path in &preview {
+                    ui.small(path);
+                }
+                if file_count > preview.len() {
+                    ui.small(format!("以及其他 {} 个文件", file_count - preview.len()));
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("记录和文件一起删除").clicked() {
+                        delete_files = true;
+                    }
+                    if ui.button("只删除记录").clicked() {
+                        delete_records_only = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if delete_files {
+            if let Some(pending) = self.pending_delete.take() {
+                for path in &pending.file_paths {
+                    let _ = fs::remove_file(path);
+                }
+                remove_task_records(&self.state, &pending.task_ids);
+                self.selected_task_id = None;
+            }
+        } else if delete_records_only {
+            if let Some(pending) = self.pending_delete.take() {
+                remove_task_records(&self.state, &pending.task_ids);
+                self.selected_task_id = None;
+            }
+        } else if cancel {
+            self.pending_delete = None;
+        }
+    }
 }
 
 fn toolbar_button(ui: &mut egui::Ui, text: &str, enabled: bool, action: impl FnOnce()) {
@@ -651,6 +745,7 @@ fn draw_task_table(
     selected_task_id: &mut Option<Uuid>,
     completed_only: bool,
     columns: &mut [f32; 8],
+    pending_delete: &mut Option<DeleteConfirmation>,
 ) {
     table_header(
         ui,
@@ -735,11 +830,12 @@ fn draw_task_table(
                         let action_width = if completed_only { 54.0 } else { 104.0 };
                         table_cell(ui, (columns[7] - action_width).max(48.0), &task.message);
                         if completed_only && ui.button("删除").clicked() {
-                            let id = task.id;
-                            state.write(|app| app.tasks.retain(|task| task.id != id));
-                            if *selected_task_id == Some(id) {
-                                *selected_task_id = None;
-                            }
+                            prepare_completed_delete(
+                                state,
+                                selected_task_id,
+                                vec![task.id],
+                                pending_delete,
+                            );
                         } else if !completed_only {
                             if matches!(
                                 task.status,
@@ -867,6 +963,53 @@ fn completed_output_path(save_dir: &PathBuf, task: &DownloadTask) -> Option<Path
         }
     }
     output.exists().then_some(output)
+}
+
+fn prepare_completed_delete(
+    state: &SharedState,
+    selected_task_id: &mut Option<Uuid>,
+    task_ids: Vec<Uuid>,
+    pending_delete: &mut Option<DeleteConfirmation>,
+) {
+    if task_ids.is_empty() {
+        return;
+    }
+
+    let task_ids = task_ids.into_iter().collect::<HashSet<_>>();
+    let detail = state.read(|app| {
+        app.tasks
+            .iter()
+            .filter(|task| task.status == DownloadStatus::Completed && task_ids.contains(&task.id))
+            .map(|task| (task.id, completed_output_path(&app.settings.save_dir, task)))
+            .collect::<Vec<_>>()
+    });
+
+    let ids = detail.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let file_paths = detail
+        .into_iter()
+        .filter_map(|(_, path)| path)
+        .collect::<Vec<_>>();
+
+    if file_paths.is_empty() {
+        remove_task_records(state, &ids);
+        if selected_task_id.is_some_and(|id| ids.contains(&id)) {
+            *selected_task_id = None;
+        }
+    } else {
+        *pending_delete = Some(DeleteConfirmation {
+            task_ids: ids,
+            file_paths,
+        });
+    }
+}
+
+fn remove_task_records(state: &SharedState, task_ids: &[Uuid]) {
+    if task_ids.is_empty() {
+        return;
+    }
+
+    let task_ids = task_ids.iter().copied().collect::<HashSet<_>>();
+    state.write(|app| app.tasks.retain(|task| !task_ids.contains(&task.id)));
 }
 
 fn output_filename(task: &DownloadTask) -> String {
